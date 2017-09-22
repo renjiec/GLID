@@ -12,13 +12,13 @@ end
 
 xs = cellfun(@(x) x/s, AutoCage(mask,1,offset,simplify,flag1), 'UniformOutput', false);
 [w, h, ~] = size(im);
+
+xs = cellfun(@(x) x(1:end-1,:), xs, 'UniformOutput', false);
 cage = cellfun(@(x) x(end:-1:1, :)*[-1i; 1]/100 - (h-w*1i)/200, xs, 'UniformOutput', false);
 
 if showResult
     figure; image(im); hold on; axis equal;
-    %imshow(im);
     cellfun(@(x) plot( conj(x([1:end 1])*100+h/2-w/2*1i), 'r', 'linewidth', 2 ), cage)
-    %image(mask);
 end
 
 end
@@ -30,14 +30,9 @@ function B=AutoCage(Mask,scale,offset,simplify,flag1)
 % simplify: maximal distance of the simplified polygon from the dilated
 % boundary of the domain
     MaskSc=double(imresize(Mask,scale));
-%     B = bwboundaries(bwmorph(MaskSc,'dilate',offset),'noholes');
-    B = bwboundaries(bwmorph(MaskSc,'dilate',offset));
+    B = bwboundaries(bwmorph(MaskSc,'dilate',offset),'noholes');
     SimpB = cellfun(@(b) dpsimplify(b,simplify), B, 'UniformOutput', false);
     SimpB = SimpB( cellfun(@(b) size(b,1)>2, SimpB) );
-
-%     figure; imagesc(MaskSc); hold on;
-%     cellfun(@(x) plot( x*[1i; 1], 'g', 'linewidth', 2 ), B)
-%     cellfun(@(x) plot( x*[1i; 1], 'r', 'linewidth', 3 ), SimpB)
     
     if flag1==1
         B = cellfun(@(b) 2*(b-1)./(size(MaskSc)-1)-1, 'UniformOutput', false);

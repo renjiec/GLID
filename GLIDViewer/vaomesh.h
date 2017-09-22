@@ -146,6 +146,7 @@ struct GLMesh
     R bbox[dim * 2];
 
 	bool showTexture;
+    bool drawTargetP2P = true;
 
     static GLProgram prog, pickProg, pointSetProg;
 
@@ -241,7 +242,6 @@ struct GLMesh
         constrainVertices.clear();
         for (size_t i = 0; i < nc; i++) constrainVertices.insert({ ids[i], vec{ pos[i * 2], pos[i * 2 + 1] } });
     }
-
 
     void setVertexDataViz(const R* val)
     {
@@ -422,18 +422,7 @@ struct GLMesh
 
         glBindVertexArray(vaoHandle);
 
-        if (vizVtxData) {
-            prog.setUniform("colorCoding", int(vizVtxData));
-            colormapTex.bind();
-        }
-
         glDrawElements(GL_TRIANGLES, 3 * nFace, GL_UNSIGNED_INT, nullptr); // not GL_INT
-
-        if (vizVtxData) {
-            prog.setUniform("colorCoding", 0);
-            tex.bind();
-        }
-
 
         glDisable(GL_DEPTH_TEST);
 
@@ -453,76 +442,8 @@ struct GLMesh
             glDrawArrays(GL_POINTS, 0, nVertex);
         }
 
-
         glBindVertexArray(0);
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-
-
-
-        //////////////////////////////////////////////////////////////////////////
-        // for interpolation
-        if (auxPointSize > 0 && !auxVtxIdxs.empty()) {
-            gpuX.bind();
-            glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(0);  // Vertex data
-            prog.setUniform("useTexMap", 0);
-            prog.setUniform("color", 0.f, 1.f, 1.f, .8f);
-            glPointSize(auxPointSize);
-            glDrawElements(GL_POINTS, auxVtxIdxs.size(), GL_UNSIGNED_INT, auxVtxIdxs.data());
-            glPointSize(1.f);
-        }
-        
-
-
-
-        if (VFDrawScale > 0 && !vertexVF.empty()){
-            MAKESURE(vertexVF.size() == nVertex * dim);
-            prog.bind();
-            prog.setUniform("color", 1.f, 0.f, 1.f, .8f);
-            GLArray<float, dim> vecfields(genVertexVF(vertexVF, VFDrawScale).data(), nVertex * 2);
-            glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(0);  // Vertex data
-            glDrawArrays(GL_LINES, 0, nVertex * 2);
-        }
-
-        if (vertexDataDrawScale>0){
-            pointSetProg.bind();
-
-            glEnable(GL_PROGRAM_POINT_SIZE);  // important for points with varying size
-            pointSetProg.setUniform("color", 0.f, 1.f, 0.f, .8f);
-            pointSetProg.setUniform("scale", vertexDataDrawScale*mMeshScale);
-            pointSetProg.setUniform("modelview", modelViewMat(vp).data());
-
-            gpuX.bind();
-            glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(0);  // Vertex data
-
-            gpuVertexData.bind();
-            glVertexAttribPointer(1, 1, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(1);  // Vertex data
-
-            glDrawArrays(GL_POINTS, 0, nVertex);
-            glDisable(GL_PROGRAM_POINT_SIZE); 
-        }
-
-
-        if (faceDataDrawScale > 0) {
-            pointSetProg.bind();
-            glEnable(GL_PROGRAM_POINT_SIZE);
-
-            gpuBaryCenters.bind();
-            glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(0);  // Face barycenters
-
-            gpuFaceData.bind();
-            glVertexAttribPointer(1, 1, GLType<R>::val, GL_FALSE, 0, nullptr);
-            glEnableVertexAttribArray(1);  // Face data
-
-            pointSetProg.setUniform("color", 0.f, 0.f, 1.f, .8f);
-            pointSetProg.setUniform("scale", faceDataDrawScale*mMeshScale);
-            pointSetProg.setUniform("modelview", modelViewMat(vp).data());
-            glDrawArrays(GL_POINTS, 0, nFace);
-        }
 
         prog.bind();
         if (!constrainVertices.empty()){
@@ -540,9 +461,10 @@ struct GLMesh
             glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
             glEnableVertexAttribArray(0);  // Vertex position
             prog.setUniform("color", 0.f, 1.f, 1.f, .8f);
-            glDrawArrays(GL_POINTS, 0, (GLsizei)idxs.size());
 
 
+            if(drawTargetP2P)
+                glDrawArrays(GL_POINTS, 0, (GLsizei)idxs.size());
 
 			gpuX.bind();
 			glVertexAttribPointer(0, dim, GLType<R>::val, GL_FALSE, 0, nullptr);
@@ -751,12 +673,7 @@ struct GLMesh
     {
         float edgeWidth0 = edgeWidth;
         float meshScale0 = mMeshScale;
-        //mMeshScale = 1.f;
         vec translate = mTranslate;
-        //mTranslate = { 0.f, 0.f };
-
-        auto auxVtxIdxs0 = auxVtxIdxs;
-        auxVtxIdxs.clear();
 
         auto constrainVtx0 = constrainVertices;
         constrainVertices.clear();
@@ -765,15 +682,12 @@ struct GLMesh
         const int vp[] = { 0, 0, width, width };
         tex1.allocateStorage(vp[2], vp[3], GL_RGBA);
 
-
-
         GLuint fbo;
         glGenFramebuffers(1, &fbo);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, tex1.handle, 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
-
 
         GLuint rboDepth;
         glGenRenderbuffers(1, &rboDepth);
@@ -785,35 +699,16 @@ struct GLMesh
 
         glClearColor(0.f, 0.f, 0.f, 0.f);
 
-        edgeColor = { 0.f, 0.f, 1.f, .5f };
-
-		//FILE *fp = fopen("GDBH.log", "a");
-		//if (fp) {
-		//	fprintf(fp, "%s: mesh draw scale = %f\n", filename, mMeshScale);
-		//	fclose(fp);
-		//}
-
-        for (int i = 0; i < 3; i++){
-            if (i != 0) continue; // no wire draw
-            edgeWidth = (i==1)*2;
-
-            if (i==2)  constrainVertices = constrainVtx0;
-
+        for (int i = 0; i < 1; i++){
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glEnable(GL_DEPTH_TEST);
             draw(vp);
 
-            std::string fn = filename;
-            if (i > 0 ){
-                int strl = strlen(filename);
-                fn = std::string(filename, strl - 4) + std::string((i==1)?"_wire":"_p2p") + (filename + strl-4);
-            }
-
-            fprintf(stdout, "saving result to %s\n", fn.c_str());
-            MyImage(tex1).write(fn);
+            fprintf(stdout, "saving result to %s\n", filename);
+            MyImage(tex1).write(filename);
         }
 
-        auxVtxIdxs = auxVtxIdxs0;
+        constrainVertices = constrainVtx0;
         edgeWidth = edgeWidth0;
         mMeshScale = meshScale0;
         mTranslate = translate;

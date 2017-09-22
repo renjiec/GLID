@@ -3,11 +3,9 @@ function [z, allStats, meshXs] = meshAQP(x, t, P2PVtxIds, P2PCurrentPositions, z
 fC2R = @(x) [real(x) imag(x)];
 fR2C = @(x) complex(x(:,1), x(:,2));
 
-
 if ~exist('OptimProblemIsoDist','file')
     addpath( genpath([pwd '\meshAQP']) );
 end
-
 
 tic
 if norm(z(P2PVtxIds) - P2PCurrentPositions)>1e-6
@@ -36,19 +34,7 @@ z = fR2C( logs.X(:, :, end) );
 
 if nargout>2, meshXs = logs.X; end
 
+allStats(:, [5 8]) = [ [preprocessTime; logs.t_iter(2:end)']*1000  logs.f'/sum(signedAreas(x,t)) ];
 
-allStats = zeros(nIter+1, 8); % statistics
-allStats(:, 5) = [preprocessTime; logs.t_iter(2:end)']*1000; 
-allStats(:, 8) = logs.f/sum(signedAreas(x,t));
-
-
-% figuredocked; h = drawmesh(T, logs.X(:,:,end));
-% 
-% set(h, 'FaceColor', 'w', 'edgealpha', 0.05);
-% for i=2:size(logs.X,3)
-%     title( sprintf('iter %d', i) );
-%     pause(0.2);
-%     set(h, 'Vertices', logs.X(:,:,i));
-% end
-
+fprintf('%dits: initilization time: %.4e, mean runtime: %.3e\n', nIter, preprocessTime*1000, mean(allStats(2:end,5)));
 

@@ -7,7 +7,7 @@ if ~iscell(xb) && ~isreal(xb), xb = [real(xb) imag(xb)]; end
 
 if ~iscell(xb), assert( size(xb, 2)==2, 'b is not a matrix with 2 columns, transposed?' ); end;
 
-triangle = which('triangle.ex_');
+triangle = which('triangle.bin');
 assert(~isempty(triangle), 'Can''t find triangle application');
 
 filename = tempname;
@@ -32,7 +32,7 @@ if nargin<5
     arg = ' -g ';
     if keepBoundary, arg = [arg '-Y ']; end
     % use num2str(..., '%f') to fix a bug of not getting target # triangles
-    if averArea>0, arg = [arg '-a' num2str(averArea, '%f') ' ']; end
+    if averArea>0, arg = [arg '-a' num2str(averArea, '%.15f') ' ']; end
     evalc(['!"' triangle '" -q30' arg filename '.poly']); 
 %     evalc(['!"' triangle '" ' arg filename '.poly']); 
 %     eval(['!"' triangle '" -c -q50 -g -Y ' filename '.poly']);
@@ -41,7 +41,7 @@ else % use input arg
 end
 
 %%
-[X, T] = loadOff( [filename '.1.off'] );
+[X, T] = readOff( [filename '.1.off'] );
 X = X(:, 1:2);
 
 eval( ['delete ' filename '.poly'] );
@@ -60,20 +60,16 @@ end
 
 
 
-function [X, T] = loadOff(filename)
+function [X, T] = readOff(filename)
 
 %%
-[fid, errmsg] = fopen(filename,'r');
-if fid == -1
-    warning(errmsg);
-    return;
-end
+[fid, errmsg] = fopen(filename, 'r');
+if fid == -1, error(errmsg); end
+cleanupObj = onCleanup(@()fclose(fid));
 
 %%
 str = textscan(fid, '%s', 1, 'CommentStyle', '#');
-if ~strcmp(str{1}, 'OFF')
-    return;
-end
+if ~strcmp(str{1}, 'OFF'), error('wrong off file signature'); end
 
 str = textscan(fid, '%d %d %d', 1, 'CommentStyle', '#');
 nv = str{1};
@@ -100,25 +96,15 @@ else
     end
 end
 
-%%
-fclose(fid);
-
 
 function writePoly(filename, xb, xi, edges)
 
-if nargin<3
-    xi = zeros(0, 2);
-end
+if nargin<3, xi = zeros(0, 2); end
+if nargin<4, edges = zeros(0, 2); end
 
-if nargin<4
-    edges = zeros(0, 2);
-end
-
-[fid,errmsg] = fopen(filename,'wt');
-if fid == -1
-    disp(errmsg);
-    return;
-end
+[fid, errmsg] = fopen(filename, 'wt');
+if fid == -1, error(errmsg); end
+cleanupObj = onCleanup(@()fclose(fid));
 
 if iscell(xb)
     if ~isreal( xb{1} )
@@ -157,14 +143,12 @@ fprintf(fid, '%d %d %d\n', [1:size(e,2); e] );
 % fprintf(fid, '%d %d %d\n', [(1:nie)+nb; edges'] );
 
 %% holes
-fC2R = @(x) [real(x) imag(x)];
+fC2R = @(x) [real(x); imag(x)];
 fprintf(fid, '%d\n', nH);
-fprintf(fid, '%d %.8f %.8f\n', [1:nH; fC2R( cellfun( @pointInPolygon, holes(:) ) )'] );
-
-fclose(fid);
+fprintf(fid, '%d %.8f %.8f\n', [1:nH; fC2R( cellfun( @findPointInPolygon, holes ) )] );
 
 
-function c = pointInPolygon(b)
+function c = findPointInPolygon(b)
 
 fR2C = @(x) complex(x(:,1), x(:,2));
 if isreal(b), b=fR2C(b); end
@@ -177,4 +161,3 @@ d( ~inpolygon(real(cc), imag(cc), real(b), imag(b)) ) = 0;
 
 [~, i] = max(d);
 c = cc(i);
-

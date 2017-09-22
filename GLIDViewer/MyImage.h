@@ -54,6 +54,7 @@ public:
 
     MyImage(BYTE* data, int ww, int hh, int pitch, int ncomp = 3) :w(ww), h(hh), comp(ncomp)
     {
+        assert(pitch >= ww * 3);
 		if (pitch == w*comp) pixels = std::vector<BYTE>(data, data + pitch*h);
 		else {
 			pixels.resize(w*comp*h);

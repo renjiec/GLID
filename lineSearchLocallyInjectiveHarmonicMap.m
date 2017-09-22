@@ -30,14 +30,16 @@ end
 
 normdpp = norm(dpp);
 
-%% non-vanishing fz, check 1
+%% non-vanishing fz
+% this check combined with the condition that min(|fz|)>0 for all segments is sufficient condition to assure that fz does not vanish inside the domain
+% proof in the paper is slightly weaker, as it requires max(|fz0|, |fz1|) > L_fz*len
 argument_princial_approx = inf;
 while ls_t*normdpp>1e-20
     fzgzt = fzgz0 + ls_t*dfzgz;
 
     dtheta = angle( fzgzt(nextSampleInSameCage,1)./fzgzt(:,1) );
     argument_princial_approx = sum( dtheta );
-    if argument_princial_approx < 1 && all( abs(dtheta)<2 )
+    if argument_princial_approx < 1
         break;
     end
 
@@ -62,7 +64,6 @@ if ~isempty(logTermIdxs)
     ddS= [ddS;  dpp(logTermIdxs,:)];
 end
 
-
 delta_L_fzgz0 = L*abs(dS);
 delta_L_fzgz1 = L*abs(dS+ls_t*ddS);
 ls_t0 = ls_t;
@@ -80,15 +81,6 @@ while true
     fzgzt = fzgz0 + ls_t*dfzgz;
 
 %     fprintf('L_fz: %.2f, L_fzbar: %.2f\n', max(L_fzgz));
-
-    %% non-vanishing fz, check 2
-    %this is the sufficient condition to assure that fz does not vanish inside the domain
-    deltaTheta = abs( angle( fzgzt(nextSampleInSameCage,1)./fzgzt(:,1) ) );
-    if sufficientstep && any( (2 + deltaTheta).*L_fzgz(:,1).*fillDistanceSegments > (2 - deltaTheta).*fAvgAbsOverSamplePairs(fzgzt(:,1)) )
-        ls_t = ls_t/2;
-        continue;
-    end
-
 
     %% local injectivity, sigma2>0
     min_absfz = fAvgAbsOverSamplePairs( fzgzt(:,1) ) - L_fzgz(:,1).*fillDistanceSegments;

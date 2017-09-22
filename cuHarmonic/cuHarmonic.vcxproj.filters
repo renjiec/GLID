@@ -15,18 +15,18 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\AQPHarmonic.cuh">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="utils.cuh">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="harmonic_map.cuh">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="cuHarmonicDeform.cuh">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
-    <CudaCompile Include="mexAQPHarmonic.cu" />
+    <CudaCompile Include="mexCUHarmonic.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dummy.cpp">

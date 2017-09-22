@@ -27,11 +27,4 @@ t(i2) = -c(i2)./b(i2);
 
 assert( ~any( a<0 & delta<0 ) );
 
-
-% t = min(t, 1);
-% t( ~isfinite(t) ) = 1; %max( t(isfinite(t)) );
-% m = e0.*(1-t*.99) + e1.*t*.99;
-% dot( m(:, [1 2]), [1 -1].*m(:, [4 3]), 2 )
-
-% assert( t>=0 );
 t = max(t, 0);

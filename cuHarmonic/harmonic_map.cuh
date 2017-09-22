@@ -1,11 +1,13 @@
 #include "utils.cuh"
 #include <math_constants.h>
 
-//#include <cub/block/block_load.cuh>
-//#include <cub/block/block_store.cuh>
 #include <cub/block/block_reduce.cuh>
 
 enum LINEAR_SOLVE_PREFERENCE { LINEAR_SOLVE_PREFER_CHOLESKY = 0, LINEAR_SOLVE_PREFER_LU = 1, LINEAR_SOLVE_FORCE_CHOLESKY = 2 };
+enum ISOMETRIC_ENERGY_TYPE { ISO_ENERGY_SYMMETRIC_DIRICHLET = 0, ISO_ENERGY_EXP_SD = 1, ISO_ENERGY_AMIPS = 2 };
+
+const char* IsometricEnergyNames[] = { "SymmDirichlet", "Exp Iso", "AMIPS" };
+__device__ const bool SPD_hessian_modification_is_simple[] = { true, true, true, false };
 
 const int threadsPerBlock = 256;
 const int nItemPerReduceThread = 10;
@@ -28,47 +30,82 @@ __global__ void sqrt_non_negative_clamp(const R *x, R *y, int n)
 
 
 //////////////////////////////////////////////////////////////////////////
+struct CageVertexIndexOffsets {
+    enum { maxHarmonicMapCageNumber = 100 };
+    int n;  // number of cages
+    int offsets[maxHarmonicMapCageNumber+1];
+};
+__constant__ CageVertexIndexOffsets cageOffsets_g;
+
+
 template<class Complex, class real>
 __global__ void abs_diff_similarity_polygon(real *dSimlarity, const Complex *phi, const Complex *dphi, const Complex *v, int n, const real *t)
 {
 	const int i = blockIdx.x*blockDim.x + threadIdx.x;
-
-
-    //if (i >= n*2) return;
-    //const int next = (i + 1) % n + n - (i < n)*n;
-    //const int prev = (i + n - 1) % n + n - (i < n)*n;
-
-    //Complex s1 = (phi[next] - phi[i]) / (v[next] - v[i]);
-    //Complex s2 = (phi[prev] - phi[i]) / (v[prev] - v[i]);
-    //dSimlarity[i] = abs(s1 - s2);
-
-    //s1 += (dphi[next] - dphi[i])**t / (v[next] - v[i]);
-    //s2 += (dphi[prev] - dphi[i])**t / (v[prev] - v[i]);
-    //dSimlarity[i+n*2] = abs(s1 - s2);
-
-
     if (i >= n) return;
+    // process phi/psy in one thread to avoid slight complex calculation of next/prev vertex indices
+
+#if 1  // for multiply connected domains
+    int nCage = cageOffsets_g.n;
+    const int *cageOffsets = cageOffsets_g.offsets;
+
+    int npp = cageOffsets[nCage] + nCage - 1;
+
+    if (i >= cageOffsets[nCage] + (nCage - 1) * 2) {   // log |z-rho| term
+        const int j = i-(nCage - 1) * 2;
+        dSimlarity[i] = abs(phi[j]);
+        dSimlarity[i+n] = abs(phi[j+npp]);
+        dSimlarity[i+n*2] = abs(dphi[j]**t + phi[j]);
+        dSimlarity[i+n*3] = abs(dphi[j+npp]**t + phi[j+npp]);
+        return;
+    }
+
+    // find which cage is the current virtual vertex on
+    int icage = 0;
+    while ( icage<nCage && i >= cageOffsets[icage+1] + icage * 2 ) ++icage;
+    assert(icage < nCage);
+
+    int fullOffset = cageOffsets[icage] + max(icage-1, 0) * 2;
+    int fullOffsetNext = cageOffsets[icage+1] + icage * 2;
+    const int next = (i+1<fullOffsetNext)?i+1:fullOffset;
+    const int prev = (i>fullOffset)?i-1:fullOffsetNext-1;
+
+    auto PPat = [icage, fullOffset](const Complex *pp, int idx) { 
+        if (icage == 0) return pp[idx];
+        if (idx-fullOffset>=2) return pp[idx-icage*2];
+        return Complex{ 0, 0 };
+    };
+
+    auto PPDiff = [PPat](const Complex *pp, int i, int j) { return PPat(pp,i)-PPat(pp,j); };
+
+#else
     const int next = (i < n - 1) ? i + 1 : 0;
     const int prev = (i > 0) ? i - 1 : n - 1;
+    auto PPDiff = [](const Complex *pp, int i, int j) { return pp[i]-pp[j]; };
+#endif
 
-    Complex s1 = (phi[next] - phi[i]) / (v[next] - v[i]);
-    Complex s2 = (phi[prev] - phi[i]) / (v[prev] - v[i]);
+
+    const Complex vn_minus_v = v[next]-v[i];
+    const Complex vp_minus_v = v[prev]-v[i];
+
+    Complex s1 = PPDiff(phi,next, i) / vn_minus_v;
+    Complex s2 = PPDiff(phi,prev, i) / vp_minus_v;
     dSimlarity[i] = abs(s1 - s2);
 
-    s1 += (dphi[next] - dphi[i])**t / (v[next] - v[i]);
-    s2 += (dphi[prev] - dphi[i])**t / (v[prev] - v[i]);
+    s1 += PPDiff(dphi,next,i)**t / vn_minus_v;
+    s2 += PPDiff(dphi,prev,i)**t / vp_minus_v;
     dSimlarity[i+n*2] = abs(s1 - s2);
 
 
-    const Complex* psy = phi + n;
-    const Complex* dpsy = dphi + n;
+    const Complex* psy = phi + npp;
+    const Complex* dpsy = dphi + npp;
 
-    s1 = (psy[next] - psy[i]) / (v[next] - v[i]);
-    s2 = (psy[prev] - psy[i]) / (v[prev] - v[i]);
+    s1 = PPDiff(psy,next,i) / vn_minus_v;
+    s2 = PPDiff(psy,prev,i) / vp_minus_v;
     dSimlarity[i+n] = abs(s1 - s2);
 
-    s1 += (dpsy[next] - dpsy[i])**t / (v[next] - v[i]);
-    s2 += (dpsy[prev] - dpsy[i])**t / (v[prev] - v[i]);
+    s1 += PPDiff(dpsy,next,i)**t / vn_minus_v;
+    s2 += PPDiff(dpsy,prev,i)**t / vp_minus_v;
     dSimlarity[i+n*3] = abs(s1 - s2);
 }
 
@@ -98,11 +135,54 @@ __global__ void p2p_energy(real *en, const Complex *fg, const Complex *dfg, cons
         atomicAdd(en+ien, block_en);
 }
 
+template<class Complex, class real>
+__global__ void buildP2PMatrixQ(const Complex *C, int m, int n, real *M)
+{
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    int j = blockIdx.y*blockDim.y + threadIdx.y;
+
+    if (i >= m || j >= n) return;
+
+    const Complex &z = C[i + j*m];
+
+    const int m2 = m * 2;
+    M[i +  j*m2]      =  z.x;
+    M[i + (j+n)*m2]   =  z.x;
+    M[i + (j+n*2)*m2] = -z.y;
+    M[i + (j+n*3)*m2] = -z.y;
+
+    M[i+m +  j*m2]      =   z.y;
+    M[i+m + (j+n)*m2]   =  -z.y;
+    M[i+m + (j+n*2)*m2] =   z.x;
+    M[i+m + (j+n*3)*m2] =  -z.x;
+}
+
+//////////////////////////////////////////////////////////////////////////
+__forceinline__ __device__ double isometric_energy_from_fz2gz2(double fz2, double gz2, int energy_type, double s=1.)
+{
+    double e;
+    switch (energy_type){
+    case ISO_ENERGY_SYMMETRIC_DIRICHLET:
+        e = (fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2));   // TODO, shift energy to 0, to see if it make any difference numerically
+        return e;
+    case ISO_ENERGY_EXP_SD:
+        //e = fabs((fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2))-2);   // TODO, shift energy to 0
+        e = (fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2));
+        return exp(s*e);
+    case ISO_ENERGY_AMIPS:
+        //return exp(abs((2 * s*(fz2 + gz2) + 1) / (fz2 - gz2) + (fz2 - gz2)) - 2 - 2 * s);  // shift energy to 0
+        return exp((2 * s*(fz2 + gz2) + 1) / (fz2 - gz2) + (fz2 - gz2)); 
+    default:
+        assert(false); // not implemented
+    }
+
+    return 0;  
+}
 
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
-__global__ void isometry_energy(real *en, const Complex *fzgz, const Complex *dfzgz, const real *t, int m, real epow)
+__global__ void isometry_energy(real *en, const Complex *fzgz, const Complex *dfzgz, const real *t, int m, int energy_type, double epow)
 {
 	const int it = blockIdx.x*blockDim.x + threadIdx.x;
     double e = 0;
@@ -112,22 +192,9 @@ __global__ void isometry_energy(real *en, const Complex *fzgz, const Complex *df
     for (int j = 0; j < nItemPerReduceThread; j++) {
         int i = it*nItemPerReduceThread + j;
         if (i >= m) continue;
-        double ee = 0;
-        if (dfzgz) {
-            double fz2 = abs2(fzgz[i] + dfzgz[i]*t[ien]);
-            double gz2 = abs2(fzgz[i + m] + dfzgz[i + m]*t[ien]);
-            ee = (fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2)) - 2;
-        }
-        else {
-            double fz2 = abs2(fzgz[i]);
-            double gz2 = abs2(fzgz[i + m]);
-            ee = (fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2)) - 2;
-        }
-
-        if (epow != 1)
-            e += powf(fabs(2*ee), epow);          
-        else
-            e += fabs(2*ee);            // fabs is for avoid numerical issue when e is exactly 0
+        double fz2 = dfzgz?abs2(fzgz[i] + dfzgz[i] * t[ien]):abs2(fzgz[i]);
+        double gz2 = dfzgz?abs2(fzgz[i + m] + dfzgz[i + m] * t[ien]):abs2(fzgz[i+m]);
+        e += isometric_energy_from_fz2gz2(fz2, gz2, energy_type, epow);
     }
 
     using BlockReduceT = cub::BlockReduce<double, threadsPerBlock, cub::BLOCK_REDUCE_RAKING>;
@@ -140,30 +207,135 @@ __global__ void isometry_energy(real *en, const Complex *fzgz, const Complex *df
 }
 
 
+
+//////////////////////////////////////////////////////////////////////////
+// for Newton reducing redundant variables 
+// compute dpp = N*( (N'*HF*N)\(N'*fC2Rv(-g)), HF is full hessian, dpp = N*x, x are free (independent) variables
+// compute N'*g for particular N for harmonic map on multiply connected domain
+template<class Complex, class R>
+__global__ void computeReducedGradient(const Complex *Gin, R *Gout)
+{
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+
+    int nCage = cageOffsets_g.n;
+    int npp = cageOffsets_g.offsets[nCage] + nCage - 1;
+    int outCageSz = cageOffsets_g.offsets[1];
+    int nvar = npp * 2;
+    int nFreeVar = nvar - nCage;
+
+    if (i >= nFreeVar) return;
+
+    const int idLastOutCagePsy = npp + outCageSz - 1;
+    int xskip = (i < idLastOutCagePsy) ? 0 : 1;
+
+    Complex v = Gin[i+xskip];
+
+    bool mergeVal = ( i >= npp - nCage + 1 && i < npp );
+    if (mergeVal) 
+        v += conj(Gin[i+xskip+npp]);
+
+    Gout[i] = v.x;
+    Gout[i+nFreeVar] = v.y;
+}
+
+
+//////////////////////////////////////////////////////////////////////////
+// compute N'*HF*N 
+template<class R>
+__global__ void computeReducedHessian(const R *Hin, R *Hout)
+{
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+    int j = blockIdx.y*blockDim.y + threadIdx.y;
+
+    int nCage = cageOffsets_g.n;
+    int npp = cageOffsets_g.offsets[nCage] + nCage - 1;
+    int outCageSz = cageOffsets_g.offsets[1];
+    int nvar = npp * 2;
+    int nFreeVar = nvar - nCage;
+
+    int n2 = nFreeVar * 2;
+    if (i >= n2 || j >= n2) return;
+
+    const int idLastOutCagePsy = npp + outCageSz - 1;
+    int xskip = (i < idLastOutCagePsy) ? 0 : (i<nFreeVar+idLastOutCagePsy?1:2);
+    int yskip = (j < idLastOutCagePsy) ? 0 : (j<nFreeVar+idLastOutCagePsy?1:2);
+
+    int nImSkip = nCage - 1;
+    xskip += (i < nFreeVar) ? 0 : nImSkip;
+    yskip += (j < nFreeVar) ? 0 : nImSkip;
+
+    const int baseIdx = (i + xskip) + (j + yskip)*nvar * 2;
+    R v = Hin[baseIdx];
+
+    auto fMergeSign = [nFreeVar](int i) {return i < nFreeVar ? 1 : -1; };
+    int iRe = i<nFreeVar?i:i-nFreeVar;
+    bool mergeRow = ( iRe >= npp - nCage + 1 && iRe < npp );
+    if (mergeRow) 
+        v += Hin[baseIdx+npp]*fMergeSign(i);
+
+    int jRe = j<nFreeVar?j:j-nFreeVar;
+    bool mergeColumn = (jRe >= npp - nCage + 1 && jRe < npp);
+    if (mergeColumn)
+        v += Hin[baseIdx+npp*nvar*2]*fMergeSign(j);
+
+    if(mergeColumn&&mergeRow)
+        v += Hin[baseIdx+npp*nvar*2 + npp]*(fMergeSign(i)*fMergeSign(j));
+
+    Hout[i + j*n2] = v;
+}
+
+//////////////////////////////////////////////////////////////////////////
+// compute dpp = N'*x
+template<class Complex, class R>
+__global__ void computeFullDPP(const R *dpp_in, Complex *dpp_out, R scale=1)
+{
+    int i = blockIdx.x*blockDim.x + threadIdx.x;
+
+    int nCage = cageOffsets_g.n;
+    int npp = cageOffsets_g.offsets[nCage] + nCage - 1;
+    int outCageSz = cageOffsets_g.offsets[1];
+    int nvar = npp * 2;
+    int nFreeVar = nvar - nCage;
+
+    if (i >= nvar) return;
+
+    Complex v = { 0, 0 };
+    const int idLastOutCagePsy = npp + outCageSz - 1;
+    //if (i == idLastOutCagePsy) v = { 0, 0 };
+
+    if (i != idLastOutCagePsy) {
+        int xskip = (i < idLastOutCagePsy) ? 0 : (i<npp+cageOffsets_g.offsets[nCage]?-1:-npp);
+        char imsign = (xskip < -1)?-1:1;
+
+        v = { dpp_in[i + xskip], dpp_in[i + xskip + nFreeVar]*imsign };
+    }
+
+    dpp_out[i] = v*scale;
+}
+
+
+
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
-__global__ void harmonic_map_sum_dargfz(real *sum, const Complex *fz, const Complex *dfz, int m, const real *t)
+__global__ void harmonic_map_sum_dargfz(real *sum, const Complex *fz, const Complex *dfz, const int *nextSampleInSameCage, int m, const real *t)
 {
     const int it = blockIdx.x*blockDim.x + threadIdx.x;
     const int isum = blockIdx.y;
 
     double s = 0;
-    int s2 = 0;
 
 #pragma unroll
     for (int j = 0; j < nItemPerReduceThread; j++) {
         int i = it*nItemPerReduceThread + j;
         if (i >= m) continue;
 
-        const int k = (i < m - 1)?i+1:0;
+        const int k = nextSampleInSameCage ? nextSampleInSameCage[i] : ((i < m - 1) ? i + 1 : 0);
         const Complex fz0 = fz[i] + dfz[i] * t[isum];
               Complex fz1 = fz[k] + dfz[k] * t[isum];
 
         fz1 = fz1*conj(fz0);
         double dtheta = atan2(fz1.y, fz1.x);
         s += dtheta;
-
-        if( abs(dtheta)>2 ) ++s2;
     }
 
     using BlockReduceT = cub::BlockReduce<double, threadsPerBlock, cub::BLOCK_REDUCE_RAKING>;
@@ -171,60 +343,16 @@ __global__ void harmonic_map_sum_dargfz(real *sum, const Complex *fz, const Comp
 
     real block_sum = real(BlockReduceT(temp_storage).Sum(s));
 
-    __syncthreads(); 
-
-    real block_sum2 = real(BlockReduceT(temp_storage).Sum(s2));
-
-    if (threadIdx.x == 0) {
-        atomicAdd(sum + isum * 2,   block_sum);
-        atomicAdd(sum + isum * 2+1, block_sum2);
-    }
+    if (threadIdx.x == 0) 
+        atomicAdd(sum + isum,   block_sum);
 }
 
-
-//////////////////////////////////////////////////////////////////////////
-template<class Complex, class real>
-__global__ void harmonic_map_validate_vanishing_fz(int *sum, const Complex *fz, const Complex *dfz, int m,
-    const Complex *fzzgzz, const Complex *dfzzgzz, const real* delta_L_fzgz, 
-    const real* sampleSpacings,  const real *t, const real step0)
-{
-    const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    const int istep = blockIdx.y;  // == 0
-
-    int check1 = 0;
-    if (i < m) {
-        const int istep = blockIdx.y;
-
-        const real tt = t[istep];
-        const int k = (i < m - 1) ? i + 1 : 0;
-        const Complex fz0 = fz[i] + dfz[i] * tt;
-        Complex fz1 = fz[k] + dfz[k] * tt;
-
-        const double delta_L_fz = delta_L_fzgz[i] + (delta_L_fzgz[i + m * 2] - delta_L_fzgz[i])*tt / step0;
-        double L_fz = 0.5*(abs(fzzgzz[i] + dfzzgzz[i] * tt) + abs(fzzgzz[k] + dfzzgzz[k] * tt));
-        L_fz += sampleSpacings[i] * delta_L_fz;
-
-        const double avgAbsFz = 0.5*(abs(fz0) + abs(fz1));
-        fz1 = fz1*conj(fz0);
-        const double deltaTheta = abs(atan2(fz1.y, fz1.x));
-
-        check1 = (2 + deltaTheta)*L_fz*sampleSpacings[i] > (2 - deltaTheta)*avgAbsFz;
-    }
-
-    using BlockReduceT = cub::BlockReduce<int, threadsPerBlock, cub::BLOCK_REDUCE_RAKING>;
-    __shared__ typename BlockReduceT::TempStorage  temp_storage;
-
-    int block_check_sum = BlockReduceT(temp_storage).Sum(check1);
-
-    if (threadIdx.x == 0 && block_check_sum > 0)
-        atomicAdd(sum + istep, block_check_sum);
-}
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
 __global__ void harmonic_map_distortion_bounds(real *bounds, const Complex *fzgz, const Complex *dfzgz, int m,
     const Complex *fzzgzz, const Complex *dfzzgzz, const real* delta_L_fzgz, 
-    const real* sampleSpacings,  const real *t, const real step0)
+    const real* sampleSpacings, const int *nextSampleInSameCage, const real *t, const real step0)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
 
@@ -233,7 +361,7 @@ __global__ void harmonic_map_distortion_bounds(real *bounds, const Complex *fzgz
 
     if (i < m) {
         const real tt = t[istep];
-        const int k = (i < m - 1) ? i + 1 : 0;
+        const int k = nextSampleInSameCage ? nextSampleInSameCage[i] : ((i < m - 1) ? i + 1 : 0);
         const double absfz0 = abs(fzgz[i] + dfzgz[i]*tt);
         const double absfz1 = abs(fzgz[k] + dfzgz[k]*tt);
         const double absgz0 = abs(fzgz[i + m] + dfzgz[i + m]*tt);
@@ -254,18 +382,6 @@ __global__ void harmonic_map_distortion_bounds(real *bounds, const Complex *fzgz
         const double max_absgz = avg_absgz + L_gz*sampleSpacings[i];
         const double max_absfz = avg_absfz + L_fz*sampleSpacings[i];
 
-
-        //double sigma1__seg = max_absfz + max_absgz;
-        //double sigma2_seg = min_absfz - max_absgz;
-        //double k_seg = max_absgz / min_absfz;
-
-        //double sigma1 = absfz0 + absgz0;
-        //double sigma2 = absfz0 - absgz0;
-        //double k = absgz0 / absfz0;
-
-        //double all_bounds[] = { max_absfz + max_absgz, min_absfz - max_absgz, max_absgz / min_absfz,
-        //                        absfz0 + absgz0, absfz0 - absgz0, absgz0 / absfz0 };
-
         all_bounds[0] = absfz0 + absgz0;
         all_bounds[1] = absfz0 - absgz0;
         all_bounds[2] = absgz0 / absfz0;
@@ -284,53 +400,93 @@ __global__ void harmonic_map_distortion_bounds(real *bounds, const Complex *fzgz
         real block_bound = real( BlockReduceT(temp_storage).Reduce(all_bounds[i], cub::Max() ) );
         atomicMaxPositive(bounds + i, block_bound);
 
-        //if (i % 3 == 1) {  // sigma2 , take min
-        //    double block_bound = BlockReduceT(temp_storage).Reduce(all_bounds[i], cub::Min() );
-        //    if (threadIdx.x == 0)
-        //        //atomicMinPositive(bounds+i, block_bound);
-        //        //atomicMin(bounds+i, block_bound);
-        //}
-        //else {             // sigma1 and k, take max
-        //    double block_bound = BlockReduceT(temp_storage).Reduce(all_bounds[i], cub::Max());
-        //    if (threadIdx.x == 0)
-        //        atomicMax(bounds+i, block_bound);
-        //}
-
-        if(i<5)  __syncthreads();
+       if(i<5)  __syncthreads();
     }
 }
 
 
+//////////////////////////////////////////////////////////////////////////
+__forceinline__ __device__ void alpha_beta_from_fz2gz2(double fz2, double gz2, double alphas[2], double* betas, int energy_type, double s=1.)
+{
+    switch (energy_type){
+    case ISO_ENERGY_SYMMETRIC_DIRICHLET: {
+        // fzgzb(:, 1).*(1 - ((fzgzb2*[1;-1]).^-3).*(fzgzb2*[1;3])) 
+        // fzgzb(:, 2).*(1 + ((fzgzb2*[1;-1]).^-3).*(fzgzb2*[3;1]))
+        double e = isometric_energy_from_fz2gz2(fz2, gz2, ISO_ENERGY_SYMMETRIC_DIRICHLET, s);
+        double w = 1;
+        alphas[0] = w*(1 - (fz2 + 3 * gz2) / pow3(fz2 - gz2));
+        alphas[1] = w*(1 + (3 * fz2 + gz2) / pow3(fz2 - gz2));
 
+        if (betas) {
+            double c = 2 / pow4(fz2 - gz2);
+            betas[0] = c * (fz2 + 5 * gz2);
+            betas[1] = c * (5 * fz2 + gz2);
+            betas[2] = -3 * c * (fz2 + gz2);
+            if (s != 1) {
+                double d = (s - 1) / s / e;
+                betas[0] = betas[0] * w + sqr(alphas[0]) *d;
+                betas[1] = betas[1] * w + sqr(alphas[1]) *d;
+                betas[2] = betas[2] * w + alphas[0] * alphas[1] * d;
+            }
+        }
+        break;
+    }
+    case ISO_ENERGY_EXP_SD: {
+        double e = isometric_energy_from_fz2gz2(fz2, gz2, ISO_ENERGY_EXP_SD, s);
+        alphas[0] = s*e*(1 - (fz2 + 3 * gz2) / pow3(fz2 - gz2));
+        alphas[1] = s*e*(1 + (3 * fz2 + gz2) / pow3(fz2 - gz2));
 
+        if (betas) {
+            double c = 2 / pow4(fz2 - gz2);
+            betas[0] = c * (fz2 + 5 * gz2) * s* e + sqr(alphas[0]) / e;
+            betas[1] = c * (5 * fz2 + gz2) * s* e + sqr(alphas[1]) / e;
+            betas[2] = -3 * c * (fz2 + gz2) * s* e + alphas[0] * alphas[1] / e;
+        }
+        break;
+    }
+    case ISO_ENERGY_AMIPS: {
+        double e = isometric_energy_from_fz2gz2(fz2, gz2, ISO_ENERGY_AMIPS, s);
+        alphas[0] = e*(1 - (4 * s*gz2 + 1) / sqr(fz2 - gz2));
+        alphas[1] = e*(-1 + (4 * s*fz2 + 1) / sqr(fz2 - gz2));
 
+        if (betas) {
+            double c = 2 / pow3(fz2 - gz2);
+            betas[0] = c*(4 * s*gz2 + 1);
+            betas[1] = c*(4 * s*fz2 + 1);
+            betas[2] = -c*(2 * s*(fz2 + gz2) + 1);
+
+            betas[0] = betas[0] * e + sqr(alphas[0]) / e;
+            betas[1] = betas[1] * e + sqr(alphas[1]) / e;
+            betas[2] = betas[2] * e + alphas[0] * alphas[1] / e;
+        }
+        break;
+    }
+    default:
+        assert(false); // energy type not implemented
+    }
+}
 
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex>
-__global__ void isometry_gradient_diagscales(Complex *x, const Complex *fzgz, int m, double epow) 
+__global__ void isometry_gradient_diagscales(Complex *x, const Complex *fzgz, int m, int energy_type, double epow) 
 {
 	const int i = blockIdx.x*blockDim.x + threadIdx.x;
 	if (i >= m) return;
 
-	const double fz2 = abs2(fzgz[i]), gz2 = abs2(fzgz[i + m]);
     using real = decltype(fzgz[i].x);
-
-    double w = 4;
-    if (epow != 1)
-        w *= powf(2*fabs((fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2)) - 2), epow - 1)*epow;
-
 	const int j = i + m;
-    // fzgzb(:, 1).*(1 - ((fzgzb2*[1;-1]).^-3).*(fzgzb2*[1;3])) 
-    // fzgzb(:, 2).*(1 + ((fzgzb2*[1;-1]).^-3).*(fzgzb2*[3;1]))
-	x[i] = fzgz[i] * real( (1 - (fz2 + 3 * gz2) / pow3(fz2 - gz2) ) * w );
-	x[j] = fzgz[j] * real( (1 + (3 * fz2 + gz2) / pow3(fz2 - gz2) ) * w );
+
+    double alphas[2];
+    alpha_beta_from_fz2gz2(abs2(fzgz[i]), abs2(fzgz[i+m]), alphas, nullptr, energy_type, epow);
+	x[i] = fzgz[i] * real( alphas[0] );
+	x[j] = fzgz[j] * real( alphas[1] );
 }
- 
+
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
-__global__ void isometry_hessian_diagscales(real *const s, const Complex *fzs, const Complex *gzs, const int *samples, int m, real epow, bool spdHessian = true)
+__global__ void isometry_hessian_diagscales(real *const s, const Complex *fzs, const Complex *gzs, const int *samples, int m, int energy_type, real epow, bool spdHessian = true)
 {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= m) return;
@@ -338,52 +494,60 @@ __global__ void isometry_hessian_diagscales(real *const s, const Complex *fzs, c
     const int sidx = samples ? samples[i] : i;
     const Complex &fz = fzs[sidx], &gz = gzs[sidx];
     const double fz2 = abs2(fz), gz2 = abs2(gz);
-    double s1 = (1 - (fz2 + 3 * gz2) / pow3(fz2 - gz2))     *4;         // *4 for hessian*4
-    double s2 = (1 + (3 * fz2 + gz2) / pow3(fz2 - gz2))     *4;
-    double s3 = (fz2 + 5 * gz2) / pow4(fz2 - gz2) * 4       *4;
-    double s4 = (5 * fz2 + gz2) / pow4(fz2 - gz2) * 4       *4;
-    double s5 = (fz2 + gz2) / pow4(fz2 - gz2) * 12          *4;
 
-    if (epow != 1) {
-        double e = 2 * fabs((fz2 + gz2)*(1 + 1 / sqr(gz2 - fz2)) - 2);
-        double w1 = powf(e, epow - 1)*epow;
-        //double w2 = powf(e, epow - 2)*(epow-1)*epow;
-        double w2 = min( w1*(epow-1)/e, 1e10 );  // avoid overflow, for zero energy: e = 0
+    double alphas[2], betas[3];
+    alpha_beta_from_fz2gz2(fz2, gz2, alphas, betas, energy_type, epow);
 
-        s3 = w1*s3 + w2*sqr(s1); 
-        s4 = w1*s4 + w2*sqr(s2); 
-        s5 = w1*s5 - w2*s1*s2; 
+    if (spdHessian) {
+        if (SPD_hessian_modification_is_simple[energy_type]) {
+            if (alphas[0] < 0) {
+                betas[0] += alphas[0] / 2 / fz2;
+                alphas[0] = 0;
+            }
+        }
+        else if(gz2>1e-15){ // general SPD modification, take care of identity map, where |gz|=0 causes problem for the following modification
+            double t1 = alphas[0] + 2 * betas[0] * fz2;
+            double t2 = alphas[1] + 2 * betas[1] * gz2;
+            const double s1 = t1 + t2, s2 = t1 - t2;
+            t1 = sqrt(sqr(s2) + 16 * sqr(betas[2])*fz2*gz2);
+            double lambda3 = s1 + t1, lambda4 = s1 - t1;
 
-        s1 *= w1;
-        s2 *= w1;
+            t1 = (lambda3 - 2 * alphas[0] - 4 * betas[0] * fz2) / (4 * betas[2] * gz2);
+            t2 = (lambda4 - 2 * alphas[0] - 4 * betas[0] * fz2) / (4 * betas[2] * gz2);
+
+            lambda3 = max(lambda3, 0.) / (fz2 + gz2*sqr(t1));
+            lambda4 = max(lambda4, 0.) / (fz2 + gz2*sqr(t2));
+
+            alphas[0] = max(alphas[0], 0.);
+            alphas[1] = max(alphas[1], 0.);
+
+            betas[0] = lambda3 + lambda4 - alphas[0] / 2 / fz2;
+            betas[1] = lambda3*sqr(t1) + lambda4*sqr(t2) - alphas[1] / 2 / gz2;
+            betas[2] = lambda3*t1 + lambda4*t2;
+        }
     }
 
-    s5 *= -1;
-    if (spdHessian && s1 < 0){
-        s3 += s1 / fz2;
-        s1 = 0;
-    }
+    alphas[0] *= 2;  alphas[1] *= 2;
+    betas[0] *= 4;  betas[1] *= 4; betas[2] *= 4;
 
-
-    real ss3     = real(fz.x * fz.y*s3);
-    s[i]         = real(sqr(fz.x)*s3 + s1);
+    real ss3     = real(fz.x * fz.y*betas[0]);
+    s[i]         = real(sqr(fz.x)*betas[0] + alphas[0]);
     s[i + m]     = ss3;
     s[i + m * 2] = ss3;
-    s[i + m * 3] = real(sqr(fz.y)*s3 + s1);
-
-
+    s[i + m * 3] = real(sqr(fz.y)*betas[0] + alphas[0]);
+                                             
     i += m * 4;
-    ss3          = real(gz.x * gz.y * s4);
-    s[i]         = real(sqr(gz.x)*s4 + s2);
+    ss3          = real(gz.x * gz.y * betas[1]);
+    s[i]         = real(sqr(gz.x)*betas[1] + alphas[1]);
     s[i + m]     = ss3;
     s[i + m * 2] = ss3;
-    s[i + m * 3] = real(sqr(gz.y)*s4 + s2);
+    s[i + m * 3] = real(sqr(gz.y)*betas[1] + alphas[1]);
 
     i += m * 4;
-    s[i]         = real(fz.x * gz.x * s5);
-    s[i + m]     = real(fz.x * gz.y * s5);
-    s[i + m * 2] = real(fz.y * gz.x * s5);
-    s[i + m * 3] = real(fz.y * gz.y * s5);
+    s[i]         = real(fz.x * gz.x * betas[2]);
+    s[i + m]     = real(fz.x * gz.y * betas[2]);
+    s[i + m * 2] = real(fz.y * gz.x * betas[2]);
+    s[i + m * 3] = real(fz.y * gz.y * betas[2]);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -429,9 +593,9 @@ __global__ void maxtForBoundk(real *t, const Complex * fz, const Complex *gz, co
 template<class Complex, class real>
 __forceinline__ __host__ __device__ 
 void p2p_harmonic_full_energy(const Complex *fzgz, const Complex *dfzgz, const Complex *fgP2P, const Complex *dfgP2P, const Complex* bP2P, int m, int nP2P, 
-    const real *steps, real *en, real isoEPow, real lambda, bool softP2P, int nsteps = 1, real *en_isometry = nullptr)
+    const real *steps, real *en, int isoEnergyType, real epow, real lambda, int nsteps = 1, real *en_isometry = nullptr)
 {
-    isometry_energy <<<dim3(reduceBlockNum(m), nsteps), threadsPerBlock >>> (en, fzgz, dfzgz, steps, m, isoEPow);
+    isometry_energy <<<dim3(reduceBlockNum(m), nsteps), threadsPerBlock >>> (en, fzgz, dfzgz, steps, m, isoEnergyType, epow);
     CUDA_CHECK_ERROR;
 
     print_gpu_value(en, "isometric energy", false);
@@ -439,19 +603,17 @@ void p2p_harmonic_full_energy(const Complex *fzgz, const Complex *dfzgz, const C
     // save isometric energies separately, for potential display/debug later 
     if(en_isometry) cudaMemcpyAsync(en_isometry, en, sizeof(real)*nsteps, cudaMemcpyDeviceToDevice);
 
-    // add P2P energy, if apply
-    if (softP2P) {
-        p2p_energy <<<dim3(blockNum(nP2P), nsteps), threadsPerBlock >>> (en, fgP2P, dfgP2P, steps, bP2P, nP2P, lambda);
-        CUDA_CHECK_ERROR;
+    // add P2P energy
+    p2p_energy << <dim3(blockNum(nP2P), nsteps), threadsPerBlock >> > (en, fgP2P, dfgP2P, steps, bP2P, nP2P, lambda);
+    CUDA_CHECK_ERROR;
 
-        print_gpu_value(en, "total energy");
-    }
+    print_gpu_value(en, "total energy");
 };
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
-__global__ void harmonic_line_search(const Complex *fzgz, const Complex *dfzgz, const Complex *fgP2P, const Complex *dfgP2P, const Complex* bP2P, int m, int nP2P,
-    real *steps, real *e, real isoepow, const real *dgdotdpp_and_norm2dpp, real lambda, bool softP2P, int enEvalsPerKernel)
+__global__ void harmonic_line_search(const Complex *fzgz, const Complex *dfzgz, const Complex *fgP2P, const Complex *dfgP2P, const int *nextSampleInSameCage, const Complex* bP2P, int m, int nP2P,
+    real *steps, real *e, int isoEnergyType, real isoepow, const real *dgdotdpp_and_norm2dpp, real lambda, int enEvalsPerKernel)
 {
     const double ls_alpha = 0.2;
     const double ls_beta = 0.5;
@@ -464,7 +626,7 @@ __global__ void harmonic_line_search(const Complex *fzgz, const Complex *dfzgz, 
     real *const sum_dargfz = en + enEvalsPerKernel*2;
     auto fQPEstim = [&](real t) { return *e + ls_alpha*t*dgdotfz; };
 
-#if 1 // one thread for linesearch
+    // use only one thread for linesearch
     if (threadIdx.x > 0) return;
 
     bool done = false;
@@ -475,27 +637,28 @@ __global__ void harmonic_line_search(const Complex *fzgz, const Complex *dfzgz, 
         //for (int i = 0; i < enEvalsPerKernel; i++) en[i] = 0;
         cudaMemsetAsync(en, 0, sizeof(real)*enEvalsPerKernel);
 #ifdef _DEBUG
-        p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoepow, lambda, softP2P, enEvalsPerKernel, en + enEvalsPerKernel);
+        p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoEnergyType, isoepow, lambda, enEvalsPerKernel, en + enEvalsPerKernel);
         cudaDeviceSynchronize();
         for (int i = 0; i < enEvalsPerKernel; i++) {
             gpu_print(en[i + enEvalsPerKernel], "isometric energy", false);
             gpu_print(en[i], "total energy");
         }
 #else
-        p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoepow, lambda, softP2P, enEvalsPerKernel);
+        p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoEnergyType, isoepow, lambda, enEvalsPerKernel);
 #endif
 
         //////////////////////////////////////////////////////////////////////////
-        // approximate argument principal to make sure fz does not vanish inside
-        cudaMemsetAsync(sum_dargfz, 0, sizeof(real)*enEvalsPerKernel*2);
-        harmonic_map_sum_dargfz <<<dim3(reduceBlockNum(m), enEvalsPerKernel), threadsPerBlock >>> (sum_dargfz, fzgz, dfzgz, m, steps);
+        // argument principal to make sure fz does not vanish inside the domain, works if the Lipschitz of fz can certify that |fz|_min>0 for all boundary segments 
+        cudaMemsetAsync(sum_dargfz, 0, sizeof(real)*enEvalsPerKernel);
+        harmonic_map_sum_dargfz <<<dim3(reduceBlockNum(m), enEvalsPerKernel), threadsPerBlock >>> (sum_dargfz, fzgz, dfzgz, nextSampleInSameCage, m, steps);
         CUDA_CHECK_ERROR;
         cudaDeviceSynchronize();
 
         for (int i = 0; i < enEvalsPerKernel; i++) {
             real ls_t = steps[i];
             const real argment_principal_eps = 1;
-            if (ls_t*normdpp < minDeformStepNorm || (en[i] < fQPEstim(ls_t) && sum_dargfz[i * 2] < argment_principal_eps && sum_dargfz[i * 2 + 1] < 0.2)) {
+            gpu_print(sum_dargfz[i], "argument principal");
+            if (ls_t*normdpp < minDeformStepNorm || (en[i] < fQPEstim(ls_t) && fabs(sum_dargfz[i]) < argment_principal_eps)) {
                 steps[0] = ls_t;
                 *e = en[i]; // output energy
                 done = true;
@@ -508,96 +671,23 @@ __global__ void harmonic_line_search(const Complex *fzgz, const Complex *dfzgz, 
 
     //if (*steps*normdpp < minDeformStepNorm) *steps = 0; // avoid the updating later in optimization
     gpu_print(*steps, "step size");
-
-#else // use multiple threads for line search
-    const int i = threadIdx.x;
-    if (i > 0) steps[i] = steps[0] * pow(ls_beta, i);
-
-    __shared__ int imaxStepSize;
-
-    while (true){
-        if (i == 0) {
-            cudaMemsetAsync(en, 0, sizeof(real)*enEvalsPerKernel);
-#ifdef _DEBUG
-            p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoepow, lambda, softP2P, enEvalsPerKernel, en + enEvalsPerKernel);
-            cudaDeviceSynchronize();
-            for (int i = 0; i < enEvalsPerKernel; i++) {
-                gpu_print(en[i + enEvalsPerKernel], "isometric energy", false);
-                gpu_print(en[i], "total energy");
-            }
-#else
-            p2p_harmonic_full_energy(fzgz, dfzgz, fgP2P, dfgP2P, bP2P, m, nP2P, steps, en, isoepow, lambda, softP2P, enEvalsPerKernel);
-#endif
-
-            //////////////////////////////////////////////////////////////////////////
-            // approximate argument principal to make sure fz does not vanish inside
-            cudaMemsetAsync(sum_dargfz, 0, sizeof(real)*enEvalsPerKernel * 2);
-            harmonic_map_sum_dargfz <<<dim3(reduceBlockNum(m), enEvalsPerKernel), threadsPerBlock >>> (sum_dargfz, fzgz, dfzgz, m, steps);
-            CUDA_CHECK_ERROR;
-            cudaDeviceSynchronize();
-
-            imaxStepSize = 100;
-        }
-
-        __syncthreads();
-
-        real ls_t = steps[i];
-        const real argment_principal_eps = 1;
-        if (ls_t*normdpp < minDeformStepNorm || (en[i] < fQPEstim(ls_t) && sum_dargfz[i * 2] < argment_principal_eps && sum_dargfz[i * 2 + 1] < 0.2)) {
-            atomicMin(&imaxStepSize, i);
-        }
-
-        if (imaxStepSize < enEvalsPerKernel) break;
-
-        steps[i] *= pow(ls_beta, enEvalsPerKernel);
-        if(i==0) gpu_print(*steps, "step size");
-    }
-
-    if (i == 0 && imaxStepSize < enEvalsPerKernel) {
-        steps[0] = steps[imaxStepSize];
-    }
-
-    if (i == 0 && *steps*normdpp < minDeformStepNorm) *steps = 0; // avoid the updating later in optimization
-    if (i == 0) gpu_print(*steps, "step size");
-#endif
 }
-
 
 
 //////////////////////////////////////////////////////////////////////////
 template<class Complex, class real>
 __global__ void harmonic_map_validate_bounds(const Complex *fzgz, const Complex *dfzgz, int m, const Complex *fzzgzz, const Complex *dfzzgzz, 
-    const real *delta_L_fzgz, const real* sampleSpacings, real *ls_t, real *bounds, const real *norm2dpp, int enEvalsPerKernel)
+    const real *delta_L_fzgz, const real* sampleSpacings, const int *nextSampleInSameCage, real *ls_t, real *bounds, const real *norm2dpp, int enEvalsPerKernel)
 {
     const double ls_beta = 0.5;
     const real normdpp = sqrt(*norm2dpp);
 
-    int *const vanishing_fz_check_sum = (int*)bounds;
     const real step0 = *ls_t;
-    while (*ls_t*normdpp > minDeformStepNorm) {
-        *vanishing_fz_check_sum = 0;
-        harmonic_map_validate_vanishing_fz <<<blockNum(m), threadsPerBlock >>> (vanishing_fz_check_sum, fzgz, dfzgz, m,
-            fzzgzz, dfzzgzz, delta_L_fzgz, sampleSpacings, ls_t, step0);
-
-        cudaDeviceSynchronize();
-
-#ifdef _DEBUG
-        printf("%20s = %d\n", "vanishing_fz_check_sum:", *vanishing_fz_check_sum);
-#endif
-
-        if (*vanishing_fz_check_sum == 0)  // fz non vanishing inside
-            break;
-
-        *ls_t *= ls_beta;
-    }
-
-    gpu_print(*ls_t, "step size (non-vanishing fz)");
-
 
     // need at least one run for the distortion bounds, TODO: or just report that it has converged
     do{        
         cudaMemsetAsync(bounds, 0, sizeof(real)*6);
-        harmonic_map_distortion_bounds <<<blockNum(m), threadsPerBlock >>> (bounds, fzgz, dfzgz, m, fzzgzz, dfzzgzz, delta_L_fzgz, sampleSpacings, ls_t, step0);
+        harmonic_map_distortion_bounds <<<blockNum(m), threadsPerBlock >>> (bounds, fzgz, dfzgz, m, fzzgzz, dfzzgzz, delta_L_fzgz, sampleSpacings, nextSampleInSameCage, ls_t, step0);
 
         cudaDeviceSynchronize();
 
@@ -638,18 +728,21 @@ struct cuHarmonicMap
 	const Complex *D2;
 	const int *hessian_samples = nullptr;
 	vecR h;	   // Hessian
-	vecC g;    // gradient  // isometry or p2p or combined, size 2n+1, last entry always set to 0, for AQP optimization
+	vecC g;    // gradient  // isometry or p2p or combined, size 2n+1
 	vecR gR;   // gradient in real
 	int m;	   // number of sample, #row in D2
 	int n;	   // number of cage vertex, #column in D2
     int mh;    // number of sample for hessian, can be <= m, the first mh rows of D2 is used for hessian computation
 
+    std::vector<int> cageVIdxOffsets; // (begin) vertex index offsets of the out cage and interior holes (except first 2 vertices), correspond to phi/psi
+
+    int isoetype = ISO_ENERGY_SYMMETRIC_DIRICHLET;
     real isoepow = 1.; // raise isometry energy to power
 
 	vecC fzgz;
 	vecR DRDI;
 
-	cublasHandle_t cub_hdl;
+    cublasHandle_t cub_hdl = 0;
 	vecC constants;
     Complex *pOne = nullptr, *pZero = nullptr, *pMinusOne = nullptr;
     Complex *p2Lambda = nullptr, *pHessianSampleRate = nullptr;        // constants 
@@ -666,11 +759,11 @@ struct cuHarmonicMap
 
 
 
-	const Complex *C2;      // Cauchy coord at p2p 
-    int nP2P;
+    const Complex *C2 = nullptr;      // Cauchy coord at p2p 
+    int nP2P = 0;
     vecC  fgP2P;
     vecC phipsy_tmpstorage, bP2P_tmpstorage, matGradP2P;
-    real P2P_weight;
+    real P2P_weight = 0;
 
     vecR C2C2BarReal;
 
@@ -683,21 +776,26 @@ struct cuHarmonicMap
     static const bool runDoublePrecision = std::is_same<real, double>::value;
 
 
-	cuHarmonicMap(const Complex *d_D2, int nSample, int dim, const int *hessian_sample_indices, int nHessSample) 
+	cuHarmonicMap(const Complex *d_D2, int nSample, int dim, const int *hessian_sample_indices, int nHessSample, const std::vector<int> &cageVertexOffsets) 
         :D2(d_D2), m(nSample), n(dim), hessian_samples(hessian_sample_indices), mh(nHessSample), phipsy(dim*2), 
-        g(dim*2+1), gR(dim*4), h(dim*dim*16), cub_hdl(0), C2(nullptr), nP2P(0), P2P_weight(0),
-        solverCHOL(dim*4-2), solverLU(dim*4) 
-    {myZeroFill(g.data() + n * 2); }
+        g(dim*2+1), gR(dim*4), h(dim*dim*16), cageVIdxOffsets(cageVertexOffsets)
+    {
+        myZeroFill(g.data() + n * 2);
+        if (cageVIdxOffsets.empty()) cageVIdxOffsets.insert(cageVIdxOffsets.end(), { 0, n });
+    }
+
     ~cuHarmonicMap() { cublasDestroy(cub_hdl); }
 
     void init();
 
     void setupP2P(const Complex *d_C2, int numberP2P, real lambda);
 
+    int nCages() const { return cageVIdxOffsets.size() - 1; }
+    int nAllVars() const { return cageVIdxOffsets.back()+(nCages()-1)*3; }     // phi_c0, phi_c1, ... w1, w2, ...
+    int numFreeVars() const { return n * 2 - nCages(); }
+
     void update_bP2P(const Complex *bP2P) {   // bP2P: target positions of p2p constraints, update matGradP2P (last column) for p2p gradient evaluation
         ChooseCublasFunc(axpy, Daxpy, Saxpy);
-        auto consts = std::vector<Complex>( constants );
-
         myZeroFill(matGradP2P.data() + nP2P*n * 2, nP2P);
         cublasStatus_t sta = axpy(cub_hdl, nP2P * 2, (const real*)pMinusOne, (const real*)bP2P, 1, (real*)( matGradP2P.data() + nP2P*n*2 ), 1);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
@@ -754,7 +852,7 @@ struct cuHarmonicMap
     const Complex* isometry_gradient(Complex* pG = nullptr) {
         assert(h_diagscales.size() >= m * 4);
         Complex *gradscales = (Complex*)(h_diagscales.data());      // diagscales has memory >= 2m complex number or 4m real numbers
-		isometry_gradient_diagscales<<<blockNum(m), threadsPerBlock>>>(gradscales, fzgz.data(), m, isoepow);
+		isometry_gradient_diagscales<<<blockNum(m), threadsPerBlock>>>(gradscales, fzgz.data(), m, isoetype, isoepow);
 		CUDA_CHECK_ERROR;
 
         pG = pG?pG:g.data();
@@ -783,24 +881,15 @@ struct cuHarmonicMap
             addToMatrixDiagonal<<<blockNum(n*4), threadsPerBlock>>>(hess, deltaFixSPDH*P2P_weight, n*4);
 
         ChooseCublasFunc(gemm, Dgemm, Sgemm);
-        ChooseCublasFunc(geam, Dgeam, Sgeam);
 
         hess = hess ? hess : h.data();
         const int n2 = n * 2;
-        //////////////////////////////////////////////////////////////////////////
-        // flip sign for dpsibar
-        cublasStatus_t sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, n * 3, n, (real*)pMinusOne, hess + n*n * 12, n2 * 2, (real*)pZero, hess, n2 * 2, hess + n*n * 12, n2 * 2);
-        ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-
-        sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, n, n * 3, (real*)pMinusOne, hess + n * 3, n2 * 2, (real*)pZero, hess, n2 * 2, hess + n * 3, n2 * 2);
-        ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-
 
         //////////////////////////////////////////////////////////////////////////
         // add p2p grad
         const real *d_CCBar = C2C2BarReal.data();        // [C2 conj(C2) -bP2P]
         // compensate for sparse sampling for the hessian
-        sta = gemm(cub_hdl, CUBLAS_OP_T, CUBLAS_OP_N, n2*2, n2*2, nP2P*2, (real*)p2Lambda, d_CCBar, nP2P*2, d_CCBar, nP2P*2, (real*)pHessianSampleRate, hess, n2*2);
+        cublasStatus_t sta = gemm(cub_hdl, CUBLAS_OP_T, CUBLAS_OP_N, n2*2, n2*2, nP2P*2, (real*)p2Lambda, d_CCBar, nP2P*2, d_CCBar, nP2P*2, (real*)pHessianSampleRate, hess, n2*2);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
 
         return hess;
@@ -833,6 +922,7 @@ struct cuHarmonicMap
     void computeNewtonStep(Complex *const dpp, Complex *const grad, int SPDHessian = ISO_HESSIAN_SPD_PERSAMPLE, cudaEvent_t *times=nullptr); 
 };
 
+
 template<class Complex, class real>
 void cuHarmonicMap<Complex, real>::setupP2P(const Complex *d_C2, int numberP2P, real lambda) 
 {
@@ -845,7 +935,6 @@ void cuHarmonicMap<Complex, real>::setupP2P(const Complex *d_C2, int numberP2P, 
     lambda *= 2;            // for p2p gradient evaluation only, therefore multiply by 2
     myCopy_n(&lambda, 1, (real*)p2Lambda, cudaMemcpyHostToDevice);
 
-
     bP2P_tmpstorage.resize(nP2P);
 
     const int n2 = n * 2;
@@ -857,9 +946,8 @@ void cuHarmonicMap<Complex, real>::setupP2P(const Complex *d_C2, int numberP2P, 
     myCopy_n(d_C2, nP2P*n, matGradP2P.data() + nP2P*n);
     conjugate_inplace <<<blockNum(nP2P*n), threadsPerBlock >>> (matGradP2P.data() + nP2P*n, nP2P*n);
 
-
     C2C2BarReal.resize(nP2P*n2 * 4);        // for computing full hessian
-    matrixRowsComplex2Real <<<dim3(ceildiv(nP2P, 4), ceildiv(n2, 32)), dim3(4, 32) >>> (matGradP2P.data(), nP2P, n2, C2C2BarReal.data());
+    buildP2PMatrixQ<Complex,real> <<<dim3(ceildiv(nP2P, 4), ceildiv(n, 32)), dim3(4, 32) >>> (C2, nP2P, n, C2C2BarReal.data());
 }
 
 template<class Complex, class real>
@@ -889,6 +977,15 @@ void cuHarmonicMap<Complex, real>::init()
 
     h_tmpstorage.resize(mh * n * 8);
     h_diagscales.resize( std::max(mh * 4 * 3, m*4) );   // make sure enough memory, which is shared by grad (complex) and hessian (real) evaluation!
+
+    //////////////////////////////////////////////////////////////////////////
+    // copy cage offsets to gpu constant memory
+    CageVertexIndexOffsets cageoffs;
+    cageoffs.n = cageVIdxOffsets.size()-1;
+    assert(cageVIdxOffsets.size() <= CageVertexIndexOffsets::maxHarmonicMapCageNumber);
+    std::copy(cageVIdxOffsets.cbegin(), cageVIdxOffsets.cend(), cageoffs.offsets);
+
+    cudaMemcpyToSymbolAsync(cageOffsets_g, &cageoffs, sizeof(CageVertexIndexOffsets));
 }
 
 template<class Complex, class real>
@@ -903,7 +1000,6 @@ const real* cuHarmonicMap<Complex, real>::isometry_hessian(real* hess)
     ChooseCublasFunc(rgemm, Dgemm, Sgemm);
     ChooseCublasFunc(dgmm, Ddgmm, Sdgmm);
     ChooseCublasFunc(geam, Dgeam, Sgeam);
-    //ChooseCublasFunc(syrk, Dsyrk, Ssyrk)
 
     const int mh2 = mh * 2;
     const int n2 = n * 2;
@@ -926,31 +1022,21 @@ const real* cuHarmonicMap<Complex, real>::isometry_hessian(real* hess)
         sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, mh, n2, pOneR, d_Htmp2, mh2, pOneR, d_Htmp2 + mh, mh2, d_Htmp1 + mh, mh2);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
 
-        // test: syrk is much less optimized!
-        //sta = syrk(cub_hdl, CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T, n2, mh2, pOneR, d_DRDI, mh2, pZeroR, subH, n2 * 2);
-
-#if 1
         // reduce matrix A loading time TODO: make sure d_Htmp2 has enough memory >2n*4n!
         sta = rgemm(cub_hdl, CUBLAS_OP_T, CUBLAS_OP_N, n2, n4, mh, pOneR, d_DRDI, mh2, d_Htmp1, mh, pZeroR, d_Htmp2, n2);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-        //sta = rgemm(cub_hdl, CUBLAS_OP_T, CUBLAS_OP_N, n2, n2, mh, pOneR, d_DRDI, mh2, d_Htmp1 + mh, mh2, pZeroR, d_Htmp2 + n2, n2 * 2);
-        //ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
 
         sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, n, n2, pOneR, d_Htmp2, n4, pMinusOneR, d_Htmp2 + n*3, n4, subH, n4);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
         sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, n, n2, pOneR, d_Htmp2 + n, n4, pOneR, d_Htmp2 + n*2, n4, subH + n, n4);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-#else
-        sta = rgemm(cub_hdl, CUBLAS_OP_T, CUBLAS_OP_N, n2, n2, mh2, pOneR, d_DRDI, mh2, d_Htmp1, mh2, pZeroR, subH, n4);
-        ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-#endif
     };
 
 
     real *const diagscales = h_diagscales.data();
     hess = hess ? hess : h.data();
 
-    isometry_hessian_diagscales <<<blockNum(mh), threadsPerBlock >>> (diagscales, fzgz.data(), fzgz.data()+m, hessian_samples, mh, isoepow, modifyHessianSPD==ISO_HESSIAN_SPD_PERSAMPLE);
+    isometry_hessian_diagscales <<<blockNum(mh), threadsPerBlock >>> (diagscales, fzgz.data(), fzgz.data()+m, hessian_samples, mh, isoetype, isoepow, modifyHessianSPD==ISO_HESSIAN_SPD_PERSAMPLE);
     CUDA_CHECK_ERROR;
 
     ComputeSubHessian(diagscales, hess);
@@ -965,8 +1051,6 @@ const real* cuHarmonicMap<Complex, real>::isometry_hessian(real* hess)
     CUDA_CHECK_ERROR;
     swapMatrixInMemory<<<dim3(ceildiv(n, 32), ceildiv(n4, 32)), blkdim>>>(hess + n, hess + n2, n, n4, n4);
     CUDA_CHECK_ERROR;
-
-
 
 
     if (modifyHessianSPD == ISO_HESSIAN_SPD_FULLEIG) {
@@ -989,16 +1073,11 @@ const real* cuHarmonicMap<Complex, real>::isometry_hessian(real* hess)
         cuVector<real> buffer(bufferSize);
         cuVector<int> info(1);
 
-        //auto H0_h = cuMem2Vec(hess, n4*n4);
         // step 2: eig
         syevd(hdl, jobz, uplo, n4, hess, n4, D.data(), buffer.data(), bufferSize, info.data());
 
-        //auto D0_h = cuMem2Vec(D.data(), n4);
         // step 3: take sqrt of D: eigen values
         sqrt_non_negative_clamp<real> <<<blockNum(n4), threadsPerBlock>> > (D.data(), D.data(), n4);
-
-        //auto V_h = cuMem2Vec(hess, n4*n4);
-        //auto D_h = cuMem2Vec(D.data(), n4);
 
         cuVector<real> sqrtHess(n4*n4);
         sta = dgmm(cub_hdl, CUBLAS_SIDE_RIGHT, n4, n4, hess, n4, D.data(), 1, sqrtHess.data(), n4);
@@ -1006,9 +1085,6 @@ const real* cuHarmonicMap<Complex, real>::isometry_hessian(real* hess)
 
         sta = rgemm(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_T, n4, n4, n4, pOneR, sqrtHess.data(), n4, sqrtHess.data(), n4, pZeroR, hess, n4);
         ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-
-        //auto sqrtHess_h = cuMem2Vec(sqrtHess.data(), n4*n4);
-        //auto H_h = cuMem2Vec(hess, n4*n4);
     }
 
 
@@ -1035,6 +1111,11 @@ void cuHarmonicMap<Complex, real>::computeNewtonStep(Complex *const dpp, Complex
 
     if (P2P_weight > 0)  p2p_gradient(grad);
     
+    // prepare for Newton
+    conjugate_inplace <<<blockNum(n), threadsPerBlock >>> (grad + n, n);
+    CUDA_CHECK_ERROR;
+
+    // after conjugate, so that it's consistent for compute dg_dot_dpp later
     myCopy_n(grad, n2, grad_out);
 
     recordEvent(times[0]); // record gradient time
@@ -1047,58 +1128,19 @@ void cuHarmonicMap<Complex, real>::computeNewtonStep(Complex *const dpp, Complex
     //////////////////////////////////////////////////////////////////////////
     real *const gradR = gR.data();
 
-    if ( linearSolvePref==LINEAR_SOLVE_FORCE_CHOLESKY || (SPDHessian!=ISO_HESSIAN_VANILLA&&linearSolvePref==LINEAR_SOLVE_PREFER_CHOLESKY) ) {
-        if (SPDHessian == ISO_HESSIAN_VANILLA) 
-            fprintf(stderr, "The vanilla Hessian for isometric energy is not necessary SPD, Cholesky solver in Newton may fail!, Consider switch to LU solver!");
+    cuSolverDN<real> *solver = &solverLU;
+    if (linearSolvePref == LINEAR_SOLVE_FORCE_CHOLESKY || (SPDHessian != ISO_HESSIAN_VANILLA&&linearSolvePref == LINEAR_SOLVE_PREFER_CHOLESKY)) solver = &solverLU;
 
-        solverCHOL.init(); // allocate memory first;
-        squareMatrixCopyWithSkip << <dim3(ceildiv(n2 * 2 - 2, 32), ceildiv(n2 * 2 - 2, 32)), dim3(32, 32) >> > (hess, n2 * 2, n2 * 2 - 2, n2 - 1, solverCHOL.A.data());
-        vectorComplex2Real << <blockNum(n2), threadsPerBlock >> > (grad, n2 - 1, gradR);
+    const int nFreeVar = numFreeVars(); // n*2-nCages(), number of complex variables to solve
+    computeReducedGradient <<<blockNum(nFreeVar), threadsPerBlock >>> (grad, gradR);
+    solver->init(nFreeVar*2); // allocate memory first;
+    computeReducedHessian <<<dim3(ceildiv(nFreeVar*2,32), ceildiv(nFreeVar*2, 32)), dim3(32, 32)>>>(hess, solver->A.data());
 
+    int solver_stat = solver->factor();
+    assert(solver_stat == 0);
+    solver->solve(gradR);
 
-        int solver_stat = solverCHOL.factor();
-
-        assert(solver_stat == 0);
-        solverCHOL.solve(gradR);
-
-        vectorReal2Complex << <blockNum(n2 - 1), threadsPerBlock >> > (gradR, n2 - 1, dpp, real(-1));
-        myCopy_n(pZero, 1, dpp + n2 - 1);
-    }
-    else {
-        ChooseCublasFunc(geam, Dgeam, Sgeam);
-        // M([1 2n+1], :) = fC2Rm(sparse(1, 1 + n, 1, 1, 2 * n));
-        cublasStatus_t sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, 1, n2 * 2, (real*)pZero, hess, n2 * 2, (real*)pZero, hess, n2 * 2, hess, n2 * 2);
-        ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-
-        sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, 1, n2 * 2, (real*)pZero, hess, n2 * 2, (real*)pZero, hess, n2 * 2, hess + n2, n2 * 2);
-        ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-
-        //myCopy_n((const real*)pOne, 1, hess + n * 4 * n);
-        //myCopy_n((const real*)pOne, 1, hess + n * 4 * n * 3 + n2);
-        myCopy_n((const real*)pOne, 1, hess + n * 4 * (n2 - 1));
-        myCopy_n((const real*)pOne, 1, hess + n * 4 * (n2 * 2 - 1) + n2);
-
-
-
-        // following does not work, because matrix M and rhs vector grad should be in correspondence
-        // M([2n 4n], :) = fC2Rm(sparse(1, 1 + n, 1, 1, 2 * n));
-        //cublasStatus_t sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, 1, n2 * 2, (real*)pZero, hess, n2 * 2, (real*)pZero, hess, n2 * 2, hess+n2-1, n2 * 2);
-        //ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-        //sta = geam(cub_hdl, CUBLAS_OP_N, CUBLAS_OP_N, 1, n2 * 2, (real*)pZero, hess, n2 * 2, (real*)pZero, hess, n2 * 2, hess+n2*2-1, n2 * 2);
-        //ensure(CUBLAS_STATUS_SUCCESS == sta, "CUBLAS error");
-        //myCopy_n((const real*)pOne, 1, hess + n*n*4+n2-1);
-        //myCopy_n((const real*)pOne, 1, hess + n*n*12+n*4-1);
-
-
-        // grad[0] -> 0;
-        myZeroFill(grad);
-        vectorComplex2Real <<<blockNum(n2), threadsPerBlock >>> (grad, n2, gradR);
-        int solver_stat = solverLU.factor(hess);
-        assert(solver_stat == 0);
-        solverLU.solve(gradR);
-
-        vectorReal2Complex <<<blockNum(n2), threadsPerBlock >>> (gradR, n2, dpp, real(-1));
-    }
+    computeFullDPP <<<blockNum(n * 2), threadsPerBlock >>> (gradR, dpp, real(-1));
 
     recordEvent(times[2]); // record solve time
 }

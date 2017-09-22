@@ -1,10 +1,10 @@
 function [z, allStats] = meshSLIM(x, t, P2PVtxIds, P2PCurrentPositions, z, nIter, lambda, energy_type, energy_parameter)
 % z: initilization
 
-if isempty(P2PVtxIds), z=x; return; end
+if isempty(P2PVtxIds), z=x; allStats=zeros(1,8); return; end
 
 if nargin < 7, lambda = 1e9; end
-if nargin < 8, energy_type = 'ISO'; end
+if nargin < 8, energy_type = 'SymmDirichlet'; end
 if nargin < 9, energy_parameter = 1; end
 
 fC2R = @(x) [real(x) imag(x)];
@@ -31,13 +31,12 @@ P2Plhs = 2*lambda*sparse(P2PVtxIds, P2PVtxIds, 1, nv, nv);
 P2Prhs = 2*lambda*sparse(P2PVtxIds, 1, P2PCurrentPositions, nv, 1);
 
 
-
 switch energy_type
 case 'ARAP'
     fIsoEnergy = @(sigs) dot( Areas, sum( (sigs-1).^2, 2) );
-case 'ISO'
+case 'SymmDirichlet'
     fIsoEnergy = @(sigs) dot( Areas, sum(sigs.^2+sigs.^-2, 2) );
-case 'EISO'
+case 'Exp_SymmDirichlet'
     fIsoEnergy = @(sigs) dot( Areas, exp( sum(sigs.^2+sigs.^-2, 2)*energy_parameter ) );
     otherwise
     warning('not supported energy: %s!', energy_type);
@@ -75,9 +74,9 @@ for it=1:nIter
     switch energy_type
     case 'ARAP'
         Sw = [1 1];
-    case 'ISO'
+    case 'SymmDirichlet'
         Sw = (S.^-2+1).*(S.^-1+1);
-    case 'EISO'
+    case 'Exp_SymmDirichlet'
         Sw = (S.^-2+1).*(S.^-1+1).*exp(energy_parameter*(S.^2+S.^-2))*2*energy_parameter;
     otherwise
         assert('energy %s not implemented for SLIM', energy_type);
@@ -125,3 +124,8 @@ for it=1:nIter
 end
 
 allStats(:,7:8) = allStats(:,7:8)/sum(Areas);
+
+
+fprintf('%dits: mean runtime: %.3e\n', nIter, mean(allStats(2:end,5)));
+    
+    

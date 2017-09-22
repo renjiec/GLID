@@ -84,19 +84,6 @@ template<>	struct MatlabNum<int>	{	static const mxClassID id = mxINT32_CLASS; };
 template<>	struct MatlabNum<float>	{	static const mxClassID id = mxSINGLE_CLASS; };
 template<>	struct MatlabNum<double>{	static const mxClassID id = mxDOUBLE_CLASS; };
 
-//template<int>	struct MatlabType	                { typedef void type; };
-//template<>	struct MatlabType<mxLOGICAL_CLASS>	{ typedef bool type; };
-//template<>	struct MatlabType<mxCHAR_CLASS>	    { typedef char type; };
-//template<>	struct MatlabType<mxINT16_CLASS>	{ typedef int16_t type; };
-//template<>	struct MatlabType<mxUINT16_CLASS>	{ typedef uint16_t type; };
-//template<>	struct MatlabType<mxINT32_CLASS>	{ typedef int32_t type; };
-//template<>	struct MatlabType<mxUINT32_CLASS>	{ typedef uint32_t type; };
-//template<>	struct MatlabType<mxINT64_CLASS>	{ typedef int64_t type; };
-//template<>	struct MatlabType<mxUINT64_CLASS>	{ typedef uint64_t type; };
-//template<>	struct MatlabType<mxSINGLE_CLASS>	{ typedef float type; };
-//template<>	struct MatlabType<mxDOUBLE_CLASS>	{ typedef double type; };
-
-
 template<typename R>
 inline mxArray* createMatlabArray(const mwSize *dims, int ndim)
 {	return mxCreateNumericArray(ndim, dims, MatlabNum<R>::id, mxREAL);	}
@@ -376,13 +363,6 @@ void eigen2matlab(const Eigen::MatrixBase<M> &v, mxArray *m)
 
     using namespace Eigen;
     Map<Matrix<R, Dynamic, Dynamic, ColMajor> >((R*)mxGetData(m), v.rows(), v.cols()) = v;
-
-	//R *pm = (R*)mxGetData(m);
-	//for ( unsigned i = 0 ; i < v.rows() ; i++ )
-	//	for ( unsigned j = 0 ; j < v.cols() ; j++ ) {
-	//		const mwSize ind2[] = {i, j};
-	//		pm[ mxCalcSingleSubscript(m, 2, ind2) ] = v(i,j);
-	//	}
 }
 
 inline void scalar2matlab(const std::string &name, double v) {
@@ -415,7 +395,7 @@ template<class M>
 void eigen2matlab(const std::string &name, const Eigen::MatrixBase<M> &v)
 {
 	typedef typename M::Scalar R;
-	mwSize dim[] = { v.rows(), v.cols() };
+	mwSize dim[] = { (mwSize)v.rows(), (mwSize)v.cols() };
 	mxArray *m = createMatlabArray<R>(dim, 2);
 	eigen2matlab(v, m);
 	getMatEngine().putVariable(name, m);

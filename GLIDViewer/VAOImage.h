@@ -265,6 +265,10 @@ void GLTexture::setImage(const MyImage &img, bool allocated, int internalFormat)
     int format = imDim2glTexInputFormat(img.dim());
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, format, GL_UNSIGNED_BYTE, img.data());
 
+    glGenerateMipmap(GL_TEXTURE_2D);  //Generate mipmaps now!!!
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+
+
     const GLfloat white[] = { 1.f, 1.f, 1.f, 1.f };
     glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, white);
 }

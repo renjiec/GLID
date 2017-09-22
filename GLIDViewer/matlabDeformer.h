@@ -22,61 +22,44 @@ inline std::string catStr(const std::vector<std::string> &names)
 
 struct MatlabDeformer : public Deformer
 {
-    std::vector<std::string> solver_names;    //const char *[] = { "newton", ... "CVX", "Direct Mosek" };
-    std::vector<std::string> energy_names;    //const char *[] = { 'ARAP', 'BARAP', 'ISO', 'EISO', 'AMIPS', 'BETA'};
-    int solver;
-    int energy_type;
-    float p2p_weight;
-
-    bool softP2P;
-    int AQP_IterPerUIUpdate;
-    Eigen::MatrixXcd C; // Cauchy Coordiantes for vertices
+    std::vector<std::string> solver_names;    //const char *[] = { "newton", ... };
+    std::vector<std::string> energy_names;    //const char *[] = { 'ISO', 'EISO', 'AMIPS' };
+    int solver = 0;
+    int energy_type = 0;
 
     MyMesh &M;
 
     MatlabDeformer(MatlabDeformer&) = delete;
 
-    MatlabDeformer(MyMesh &m) :M(m), solver(0), 
-        p2p_weight(100000.f), 
-        softP2P(true), AQP_IterPerUIUpdate(10) {
+    MatlabDeformer(MyMesh &m) :M(m){
 
         using deformerptr = MatlabDeformer*;
 
-        TwBar *bar = TwNewBar("ShapeDeformer");
+        TwBar *bar = TwNewBar("GLIDDeformer");
 
-        TwDefine(" ShapeDeformer size='220 180' color='255 0 255' text=dark alpha=128 position='5 380' label='Shape Deformer'"); // change default tweak bar size and color
+        TwDefine(" GLIDDeformer size='220 180' color='255 0 255' text=dark alpha=128 position='5 300' label='GLID Deformer'"); // change default tweak bar size and color
 
         //////////////////////////////////////////////////////////////////////////
-
         solver_names = matlab2strings("harmonic_map_solvers");
         std::string defaultsolver = matlab2string("default_harmonic_map_solver");
-        solver = 0;
-        for (int i = 0; i < solver_names.size(); i++) {
-            if (defaultsolver == solver_names[i]) solver = i;
-        }
+        for (int i = 0; i < solver_names.size(); i++) if (defaultsolver == solver_names[i]) solver = i;
 
         energy_names = matlab2strings("harmonic_map_energies");
         std::string defaultenergy = matlab2string("default_harmonic_map_energy");
-        energy_type = 0;
-        for (int i = 0; i < energy_names.size(); i++) {
-            if (defaultenergy == energy_names[i]) energy_type = i;
-        }
+        for (int i = 0; i < energy_names.size(); i++) if (defaultenergy == energy_names[i]) energy_type = i;
 
-        TwAddButton(bar, "Clear P2P", [](void *d) { 
-            deformerptr(d)->M.constrainVertices.clear(); 
-            deformerptr(d)->M.actConstrainVertex = -1; 
-            deformerptr(d)->updateP2PConstraints(-1); },
-            this, " ");
+        TwType energyType = TwDefineEnumFromString("Energy", catStr(energy_names).c_str());
+        TwAddVarRW(bar, "Energy", energyType, &energy_type, " ");
+ 
+        TwType solverType = TwDefineEnumFromString("Solver", catStr(solver_names).c_str());
+        TwAddVarRW(bar, "Solver", solverType, &solver, " ");
 
-        TwAddButton(bar, "Reset Mesh", [](void *d) {
-            deformerptr(d)->resetDeform(); 
-            deformerptr(d)->M.mMeshScale = 1.f;
-            deformerptr(d)->M.mTranslate.assign(0.f);
-            matlabEval("AQP_preprocessed = false; P2P_Deformation_Converged = 0;"); }, this, " key=r ");
 
         //////////////////////////////////////////////////////////////////////////
-
-        TwAddVarRW(bar, "P2P weight", TW_TYPE_FLOAT, &p2p_weight, " ");
+        TwAddVarCB(bar, "P2P weight", TW_TYPE_FLOAT, 
+            [](const void *v, void *) { scalar2matlab("p2p_weight", *(const float*)(v)); },
+            [](void *v, void *) { *(float*)(v) = matlab2scalar("p2p_weight"); },
+            nullptr, " min=0 ");
 
         TwAddVarCB(bar, "#Samples", TW_TYPE_INT32, 
             [](const void *v, void *d) { scalar2matlab("numEnergySamples", *(const int*)(v)); 
@@ -90,11 +73,32 @@ struct MatlabDeformer : public Deformer
             [](void *v, void *)       { *(float*)(v) = matlab2scalar("energy_parameter"); },
             nullptr, " min=0 help='change the parameter for some energies, e.g. AMIPS, BARAP, power iso' ");
 
+        TwAddButton(bar, "Reset View", [](void *d) {
+            deformerptr(d)->M.updateBBox();
+            deformerptr(d)->M.mMeshScale = 1.f;
+            deformerptr(d)->M.mTranslate.assign(0.f);
+        }, this, " ");
+
+        TwAddButton(bar, "Reset Shape", [](void *d) {
+            deformerptr(d)->resetDeform(); 
+            matlabEval("NLO_preprocessed = false; P2P_Deformation_Converged = 0;"); }, this, " key=r ");
+
+        TwAddVarCB(bar, "Pause", TW_TYPE_BOOLCPP,
+            [](const void *v, void *d) {  deformerptr(d)->needIteration = !*(bool*)(v); },
+            [](void *v, void *d) { *(bool*)(v) = !deformerptr(d)->needIteration; },
+            this, " key=i ");
+
+        TwAddButton(bar, "Clear P2P", [](void *d) { 
+            deformerptr(d)->M.constrainVertices.clear(); 
+            deformerptr(d)->M.actConstrainVertex = -1; 
+            deformerptr(d)->updateP2PConstraints(-1); },
+            this, " ");
+
         preprocess();
     }
 
     ~MatlabDeformer(){
-        TwBar *bar = TwGetBarByName("ShapeDeformer");
+        TwBar *bar = TwGetBarByName("GLIDDeformer");
         if (bar)    TwDeleteBar(bar); 
     }
 
@@ -104,7 +108,6 @@ struct MatlabDeformer : public Deformer
     {
         matlabEval("p2p_harmonic_prep;");
 
-        C = matlab2eigenComplex("C");
         deformResultFromMaltab("XP2PDeform");
     }
 
@@ -124,55 +127,30 @@ struct MatlabDeformer : public Deformer
     void deformResultFromMaltab(std::string resVarName)
     {
         using namespace Eigen;
-		if ( !resVarName.compare("PhiPsy") ) { // do all interpolation computation in matlab, for better performance with # virtual vertex > 1
-			MatrixXcd Phi = matlab2eigenComplex("Phi");
-			MatrixXcd Psy = matlab2eigenComplex("Psy");
+        MatrixXcd x = matlab2eigenComplex(resVarName);
+        if (x.rows() == 0) return;
 
-			if (Phi.rows() == 0 || Psy.rows() == 0 || C.rows() == 0) return;
-
-			Eigen::VectorXcd x = C*Phi + (C*Psy).conjugate();
-
-			if (getMatEngine().hasVar("rot_trans")) {
-				// for interpolation
-				Vector2cd rot_trans = matlab2eigenComplex("rot_trans");
-				x = x.array()*rot_trans(0) + rot_trans(1);
-			}
-
-			if (x.rows() == 0) return;
-
-			Matrix<float, Dynamic, 2, RowMajor> xr(x.rows(), 2);
-			xr.col(0) = x.real().cast<float>();
-			xr.col(1) = x.imag().cast<float>();
-			M.upload(xr, Eigen::MatrixXi(), nullptr);
-		}
-		else {
-			MatrixXcd x = matlab2eigenComplex(resVarName);
-			if (x.rows() == 0) return;
-
-			Matrix<float, Dynamic, 2, RowMajor> xr(x.rows(), 2);
-			xr.col(0) = x.real().cast<float>();
-			xr.col(1) = x.imag().cast<float>();
-			M.upload(xr, Eigen::MatrixXi(), nullptr);
-		}
+        Matrix<float, Dynamic, 2, RowMajor> xr(x.rows(), 2);
+        xr.col(0) = x.real().cast<float>();
+        xr.col(1) = x.imag().cast<float>();
+        M.upload(xr, Eigen::MatrixXi(), nullptr);
     }
 
     virtual void deform()
     {
         string2matlab("solver_type", solver_names[solver]);
         string2matlab("energy_type", energy_names[energy_type]);
-        scalar2matlab("p2p_weight", p2p_weight);
         matlabEval("p2p_harmonic;");
-        matlabEval("clear rot_trans;");
 
         deformResultFromMaltab("XP2PDeform");
     }
 
     virtual bool converged() {
-        return matlab2scalar("P2P_Deformation_Converged", 0) > 0;
+        return !getMatEngine().hasVar("P2P_Deformation_Converged")  ||  matlab2scalar("P2P_Deformation_Converged") > 0;
     }
 
     virtual void resetDeform() {
-		matlabEval("Phi = vv; Psy = Phi * 0; XP2PDeform = X; phipsyIters = []; clear rot_trans;");
+		matlabEval("Phi = vv; Psy = Phi * 0; XP2PDeform = X; phipsyIters = [];");
         deformResultFromMaltab("XP2PDeform"); 
     }
     virtual void getResult() {}

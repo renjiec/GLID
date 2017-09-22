@@ -359,7 +359,7 @@ int initGL(int argc, char **argv)
     glutMouseFunc( onMouseButton );
     glutMotionFunc( onMouseMove );
     glutMouseWheelFunc( onMouseWheel );
-    //glutCloseFunc([](){});
+    glutCloseFunc([]() {exit(0); });
     return 0;
 }
 
@@ -371,10 +371,9 @@ void createTweakbar()
 
      //Create a tweak bar
     bar = TwNewBar("MeshViewer");
-    TwDefine(" MeshViewer size='220 200' color='0 128 255' text=dark alpha=128 position='5 5'"); // change default tweak bar size and color
+    TwDefine(" MeshViewer size='220 150' color='0 128 255' text=dark alpha=128 position='5 5' label='Mesh Viewer'"); // change default tweak bar size and color
 
     TwAddVarRO(bar, "#Vertex", TW_TYPE_INT32, &M.nVertex, " group='Mesh View'");
-    TwAddVarRO(bar, "#Face", TW_TYPE_INT32, &M.nFace, " group='Mesh View'");
 
     TwAddVarCB(bar, "WireFrame", TW_TYPE_BOOLCPP, 
         [](const void *v, void *) { M.edgeWidth = *(bool*)(v); },
@@ -387,12 +386,6 @@ void createTweakbar()
         nullptr, " group='Mesh View' help='show texture on mesh' ");
 
     //////////////////////////////////////////////////////////////////////////
-    TwAddSeparator(bar, " Deformer ", " ");
-    TwAddVarCB(bar, "Pause", TW_TYPE_BOOLCPP, 
-        [](const void *v, void *) {  if (deformer) deformer->needIteration = !*(bool*)(v); },
-        [](void *v, void *)       { *(bool*)(v) = !(deformer?deformer->needIteration:false); },
-        nullptr, " key=i ");
-
     TwType datasetTWType = TwDefineEnumFromString("Datasets", catStr(dataset_names).c_str());
     TwAddVarCB(bar, "Shape", datasetTWType,
         [](const void *v, void *d) {
@@ -403,47 +396,21 @@ void createTweakbar()
         nullptr, " ");
 
     TwAddButton(bar, "Save Image", [](void *d) {
-        std::string meshfilebasename = meshName;
+        std::string imgfile = datadir + (deformer ? deformer->name() : meshName) + ".png";
 
-        if (meshName.size() > 4 && !strcmp(meshName.data() + meshName.size() - 4, ".obj"))
-            meshfilebasename = meshName.substr(0, meshName.size() - 4);
-
-        std::string imgfile = datadir + (deformer ? deformer->name() : meshfilebasename) + "_p2p"+std::to_string( int(matlab2scalar("iP2P", 1) - 1) ) + ".png";
-
-        //M.updateBBox(); // TODO: do not update bbox so that the scale is the same for different algs
         M.saveResultImage(imgfile.c_str(), saveImageResolution); },
         nullptr, " key=p ");
 
-    TwAddButton(bar, "Save data", [](void *d){
-        if (deformer){
-            deformer->saveData();
-            //std::string objfile = datadir + deformer->name() + "_src.obj";
-            ////fprintf(stdout, "saving source mesh to %s\n", objfile.c_str());
-            //saveMesh(objfile, true);
-            //objfile = datadir + deformer->name() + ".obj";
-            ////fprintf(stdout, "saving result mesh to %s\n", objfile.c_str());
-            //saveMesh(objfile, false);
-        }
-
-        //const std::string filename = getFileName(textureFile);
-        //const size_t szFileName = filename.length();
-        //const char *extname = (szFileName > 4 && filename[szFileName - 4] == '.') ? filename.c_str() + szFileName - 4 : ".png";
-        //std::string imgfile(filename.data(), filename.data() + szFileName - 4);
-        //imgfile += std::string("_result") + extname;
-        },
+    TwAddButton(bar, "Save data", [](void *d){ if (deformer) deformer->saveData(); },
         nullptr, " key=S ");
 }
 
 int main(int argc, char *argv[])
 {
-    SetConsoleScreenBufferSize(GetStdHandle(STD_OUTPUT_HANDLE), { 100, 5000 });
-
     if (initGL(argc, argv)){
         fprintf(stderr, "!Failed to initialize OpenGL!Exit...");
         exit(-1);
     }
-	dumpGLInfo();
-
 
 	MyMesh::buildShaders();
 
@@ -459,7 +426,10 @@ int main(int argc, char *argv[])
     //////////////////////////////////////////////////////////////////////////
     atexit([]{ deformer.reset(); TwDeleteAllBars();  TwTerminate(); glutExit(); });  // Called after glutMainLoop ends
 
-    glutIdleFunc([]() { if (deformer && deformer->needIteration && !deformer->converged()) deformer->deform();  glutPostRedisplay(); });
+    glutIdleFunc([]() { 
+        if (deformer && deformer->needIteration && !deformer->converged()) { deformer->deform();  glutPostRedisplay(); }
+        else this_thread::sleep_for(50ms);
+    });
 
     glutTimerFunc(1000, [](int) {
         getMatEngine().connect("");

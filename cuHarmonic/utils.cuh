@@ -3,11 +3,14 @@
 #include <cusolverDn.h>
 #include <vector>
 #include <cassert>
-#include <iostream>
 #include <algorithm>
 
  
 inline __host__ __device__ int ceildiv(int m, int n) { return (m - 1) / n + 1; }
+
+#ifdef __CUDA_ARCH__ 
+#undef printf // undef mexPrintf
+#endif
 
 inline void cudaCheckError(const char* file, int line)
 {
@@ -46,18 +49,9 @@ __host__ __device__ void print_gpu_value(const R *d_v, const char* valname = "va
 #if defined(_DEBUG) && !defined(__CUDA_ARCH__)      // do not call the following on cuda kernel
     R v[n];
     cudaMemcpy(v, d_v, sizeof(R)*n, cudaMemcpyDeviceToHost);
-    //fprintf(stdout, "%20s = ", valname);
-    //printf("%20s = ", valname);
-    //for (int i = 0; i < n; i++)
-    //    printf("%10e%s", float(v[i]), (i < n - 1) ? "\t" : (newline?"\n":""));
-
-    char str[200];
-    sprintf(str, "%20s = ", valname);
-    std::cout << str;
-    for (int i = 0; i < n; i++) {
-        sprintf(str, "%6.5e%s", float(v[i]), (i < n - 1) ? "\t" : (newline ? "\n" : ""));
-        std::cout << str;
-    }
+    printf("%20s = ", valname);
+    for (int i = 0; i < n; i++) 
+        printf("%6.5e%s", v[i], (i < n - 1) ? "\t" : (newline ? "\n" : ""));
 #endif
 }
 
@@ -72,8 +66,7 @@ __device__ void gpu_print(const R v, const char* valname = "value", bool newline
 }
 
 
-inline void ensure(bool cond, const char *msg, ...)
-{   if (!cond) { va_list args; va_start(args, msg); vfprintf(stderr, (msg+std::string("\n")).c_str(), args); va_end(args); } }
+#define ensure(cond, msg) if (!(cond)) fprintf(stderr, (msg+std::string(" at file %s, line %d\n")).c_str(), __FILE__, __LINE__);
 
 #define EnableForComplexReturn(ret) __forceinline__ __host__ __device__ \
 std::enable_if_t<std::is_same<Complex, cuFloatComplex>::value || std::is_same<Complex, cuDoubleComplex>::value, ret>
@@ -85,7 +78,7 @@ EnableForComplexReturn(Complex) operator+(const Complex& a, const Complex& b) { 
 template<class Complex>
 EnableForComplexReturn(Complex) operator-(const Complex& a, const Complex& b) { return Complex{ a.x-b.x, a.y-b.y }; }
 template<class Complex, class real>
-EnableForComplexReturn(Complex) operator*(const Complex& a, const real b) { return Complex{ a.x*b, a.y*b }; }
+EnableForComplexReturn(Complex) operator*(const Complex& a, const real b) { using R = decltype(a.x); return Complex{ R(a.x*b), R(a.y*b) }; }
 template<class Complex>
 EnableForComplexReturn(Complex) operator*(const Complex& a, const Complex& b) { return Complex{ a.x*b.x-a.y*b.y, a.x*b.y+a.y*b.x }; }
 template<class Complex>
@@ -108,16 +101,8 @@ __forceinline__ __host__ __device__ double pow4(real x) { return sqr( sqr(x) ); 
 
 #undef EnableForComplexReturn    
 
-//__forceinline__ __host__ __device__ float4  operator+=(float4 & a, const float4&  b) { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; return a; }
-//__forceinline__ __host__ __device__ double4 operator+=(double4& a, const double4& b) { a.x += b.x; a.y += b.y; a.z += b.z; a.w += b.w; return a; }
-//template<typename real>
-//__forceinline__ __host__ __device__ void mad(double4& a, const double4& b, const real& s) { a.x += s*b.x; a.y += s*b.y; a.z += s*b.z; a.w += s*b.w; }
-//template<typename real>
-//__forceinline__ __host__ __device__ void mad(float4& a,  const float4& b,  const real& s) { a.x += s*b.x; a.y += s*b.y; a.z += s*b.z; a.w += s*b.w; }
-
-
 template<class T>
-__host__ __device__ inline cudaError_t myCopy_n(const T *src, int n, T *dst, cudaMemcpyKind cpydir=cudaMemcpyDeviceToDevice) { return cudaMemcpyAsync(dst, src, sizeof(T)*n, cpydir); }
+inline cudaError_t myCopy_n(const T *src, int n, T *dst, cudaMemcpyKind cpydir=cudaMemcpyDeviceToDevice) { return cudaMemcpyAsync(dst, src, sizeof(T)*n, cpydir); }
 
 template<class T>
 inline T copyValFromGPU(const T *src) {
@@ -129,23 +114,7 @@ inline T copyValFromGPU(const T *src) {
 template<class T>
 inline cudaError_t myZeroFill(T *dst, int n = 1) { return cudaMemsetAsync(dst, 0, sizeof(T)*n); }
 
-template<class R>
-std::vector<R> cuMem2Vec(const R *v, int m)
-{
-#ifdef _DEBUG
-    std::vector<R> x(m);
-    //thrust::copy_n(thrust::device_pointer_cast(v), m, &x[0]);
-    cudaMemcpy(&x[0], v, sizeof(R)*m, cudaMemcpyDeviceToHost);
-    return x;
-#else
-    return std::vector<R>();
-#endif
-}
-
-
-#if defined(__CUDA_ARCH__)
-
-#if __CUDA_ARCH__ < 600
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600
 __inline__ __device__ double atomicAdd(double* address, double val)
 {
     unsigned long long int* address_as_ull = (unsigned long long int*)address;
@@ -157,7 +126,6 @@ __inline__ __device__ double atomicAdd(double* address, double val)
 
     return __longlong_as_double(old);
 }
-#endif
 #endif
 
 __forceinline__ __device__ void atomicMinPositive(float *t, float x)
@@ -296,12 +264,12 @@ __global__ void vectorComplex2Real(const Complex *x, int n, real *y)
 }
 
 template<class Complex, class real>
-__global__ void vectorReal2Complex(const real *x, int n, Complex *y, real scale=1.)
+__global__ void vectorReal2Complex(const real *x, int ldx, int n, Complex *y, real scale=1.)
 {
     int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
 
-    y[i] = Complex({ x[i]*scale, x[i + n]*scale });
+    y[i] = Complex({ x[i]*scale, x[i + ldx]*scale });
 }
 
 template<class Complex, class real>
@@ -343,36 +311,33 @@ struct cuVector
     T* pdata = nullptr;
     int len;
 
-    cuVector(const cuVector& b):cuVector(b.size(), b.data(), false) {}
+    cuVector(const cuVector&) = delete;
     cuVector& operator=(const cuVector&) = delete;
     cuVector(cuVector&& t):len(0), pdata(nullptr) { std::swap(pdata, t.pdata); std::swap(len, t.len); }
 
-    cuVector(int n = 0) :len(n),pdata(nullptr) {
-        if (len > 0) cudaMalloc((void **)&pdata, sizeof(T)*len);
-    }
-
-    cuVector(const T* s, const T* e, bool fromHost = true) :len(e-s), pdata(nullptr) {
+    cuVector(int n = 0, const T* srcbegin=nullptr) :len(n),pdata(nullptr) {
         if (len > 0) {
-            cudaMalloc((void **)&pdata, sizeof(T)*len);
-            cudaMemcpyAsync(pdata, s, len * sizeof(T), fromHost ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToDevice);
+            checkCudaErrors(cudaMalloc((void **)&pdata, sizeof(T)*len));
+            if (srcbegin)
+                checkCudaErrors(cudaMemcpyAsync(pdata, srcbegin, len * sizeof(T), cudaMemcpyHostToDevice));
         }
     }
 
     cuVector(const std::vector<T> &v) :len(v.size()),pdata(nullptr) {
         if (len > 0) {
-            cudaMalloc((void **)&pdata, sizeof(T)*len);
-            cudaMemcpyAsync(pdata, v.data(), len * sizeof(T), cudaMemcpyHostToDevice);
+            checkCudaErrors(cudaMalloc((void **)&pdata, sizeof(T)*len));
+            checkCudaErrors(cudaMemcpyAsync(pdata, v.data(), len * sizeof(T), cudaMemcpyHostToDevice));
         }
     }
 
-    ~cuVector() { clear(); }
+    ~cuVector() { if (pdata) checkCudaErrors(cudaFree(pdata)); }
 
     int size() const { return len; }
     bool empty() const { return len == 0; }
 
     void clear() {
         if (pdata) {
-            cudaFree(pdata);
+            checkCudaErrors(cudaFree(pdata));
             pdata = nullptr;
             len = 0;
         }
@@ -383,26 +348,50 @@ struct cuVector
 
     cuVector& operator =(const std::vector<T> &v){
         resize(v.size(), false);
-        cudaMemcpyAsync(pdata, v.data(), len*sizeof(T), cudaMemcpyHostToDevice);
+        checkCudaErrors(cudaMemcpyAsync(pdata, v.data(), len*sizeof(T), cudaMemcpyHostToDevice));
         return *this;
     }
 
     cuVector& operator =(cuVector&& t) { std::swap(pdata, t.pdata); std::swap(len, t.len); return *this; }
 
-    void zero_fill() { cudaMemsetAsync(pdata, 0, sizeof(T)*len); }
+    void zero_fill() {checkCudaErrors(cudaMemsetAsync(pdata, 0, sizeof(T)*len)); }
 
-    void copy_to(T* dst, bool tohost=true) const { cudaMemcpyAsync(dst, pdata, len * sizeof(T), tohost?cudaMemcpyDeviceToHost:cudaMemcpyDeviceToDevice); }
+    void to_host(T* dst, int n) const {
+        assert(n <= len); 
+        checkCudaErrors(cudaMemcpyAsync(dst, pdata, n * sizeof(T), cudaMemcpyDeviceToHost));
+    }
     
-    operator std::vector<T>() const { std::vector<T> v(len); copy_to(v.data()); return v; }
+    operator std::vector<T>() const { std::vector<T> v(len); to_host(v.data(), len); return v; }
 
     void resize(int n, bool copyData=true) {
         if (n == len) return;
 
         cuVector<T> v2(n);
-        if (copyData && len > 0) cudaMemcpyAsync(v2.data(), pdata, std::min(len, n) * sizeof(T), cudaMemcpyDeviceToDevice);
+        if (copyData && len > 0) checkCudaErrors(cudaMemcpyAsync(v2.data(), pdata, std::min(len, n) * sizeof(T), cudaMemcpyDeviceToDevice));
+
         std::swap(*this, v2);
     }
 };
+
+
+template<class R>
+struct cuSolverDN
+{
+    cusolverDnHandle_t handle;
+    cuVector<R> buffer;
+    cuVector<R> A;
+    cuVector<int> info;
+    int n = 0;
+
+    cuSolverDN() :handle(nullptr), info(1) { info.zero_fill(); }
+    virtual ~cuSolverDN() {  if(handle)   cusolverDnDestroy(handle); }
+
+    void init(int neq) { n = neq; A.resize(n*n, false); }
+
+    virtual int factor(const R* A0 = nullptr) = 0;
+    virtual int solve(R *const) = 0;
+};
+
 
 
 #define ChooseCusolverDnFunc(fun, dfun, sfun) \
@@ -410,36 +399,20 @@ struct cuVector
     const auto fun = runDoublePrecision ? (fun##type)&cusolverDn##dfun : (fun##type)&cusolverDn##sfun;
 
 template<class R>
-struct cuLUSolverDn
+struct cuLUSolverDn : public cuSolverDN<R>
 {
-    cusolverDnHandle_t handle;
+    cuVector<int> ipiv; // pivot for LU solver
 
-    using gpuIVec = cuVector<int>;
-    using gpuVec = cuVector<R>;
-
-    gpuVec buffer;
-    gpuVec A;
-    gpuIVec info;
-    gpuIVec ipiv; // pivot for LU solver
-    const int n;
-
-    cuLUSolverDn(int neq) :handle(nullptr), info(1), n(neq)  { info.zero_fill(); }
-    ~cuLUSolverDn() {  if(handle)   cusolverDnDestroy(handle); }
-
-    void init() { A.resize(n*n, false); }
+    cuLUSolverDn()  {}
+    ~cuLUSolverDn() {}
 
     int factor(const R* A0 = nullptr) {
         if(!handle)   cusolverDnCreate(&handle);
 
-#if 0
-        const bool runDoublePrecision = std::is_same<decltype(A0->x), double>::value;
-        ChooseCusolverDnFunc(getrf_bufferSize, Zgetrf_bufferSize, Cgetrf_bufferSize);
-        ChooseCusolverDnFunc(getrf, Zgetrf, Cgetrf);
-#else
         const bool runDoublePrecision = std::is_same<R, double>::value;
         ChooseCusolverDnFunc(getrf_bufferSize, Dgetrf_bufferSize, Sgetrf_bufferSize);
         ChooseCusolverDnFunc(getrf, Dgetrf, Sgetrf);
-#endif
+
         A.resize(n*n, false);   // allocate memory if necessary
         if (A0 && A0 != A.data())  myCopy_n(A0, n*n, A.data());
 
@@ -457,13 +430,9 @@ struct cuLUSolverDn
     }
 
     int solve(R *const b) {
-#if 0
-        const bool runDoublePrecision = std::is_same<decltype(b->x), double>::value;
-        ChooseCusolverDnFunc(getrs, Zgetrs, Cgetrs);
-#else
+
         const bool runDoublePrecision = std::is_same<R, double>::value;
         ChooseCusolverDnFunc(getrs, Dgetrs, Sgetrs);
-#endif
 
         // b will be rewritten in place on return
         getrs(handle, CUBLAS_OP_N, n, 1, A.data(), n, ipiv.data(), b, n, info.data());
@@ -474,36 +443,20 @@ struct cuLUSolverDn
 
 
 template<class R>
-struct cuCholSolverDn
+struct cuCholSolverDn: public cuSolverDN<R>
 {
-    cusolverDnHandle_t handle;
-
-    using gpuIVec = cuVector<int>;
-    using gpuVec = cuVector<R>;
-
-    gpuVec buffer;
-    gpuVec A;
-    gpuIVec info;
-    const int n;
-
     static const cublasFillMode_t uplo = CUBLAS_FILL_MODE_LOWER;
 
-    cuCholSolverDn(int neq) :handle(nullptr), info(1), n(neq) { info.zero_fill(); }
-    ~cuCholSolverDn() {  if(handle)   cusolverDnDestroy(handle); }
-
-    void init() { A.resize(n*n, false); }
+    cuCholSolverDn() {}
+    virtual ~cuCholSolverDn() {}
 
     int factor(const R* A0 = nullptr) {
         if(!handle)   cusolverDnCreate(&handle);
 
         const bool runDoublePrecision = std::is_same<R, double>::value;
-#if 0
-        ChooseCusolverDnFunc(potrf_bufferSize, Zpotrf_bufferSize, Cpotrf_bufferSize);
-        ChooseCusolverDnFunc(potrf, Zpotrf, Cpotrf);
-#else
+
         ChooseCusolverDnFunc(potrf_bufferSize, Dpotrf_bufferSize, Spotrf_bufferSize);
         ChooseCusolverDnFunc(potrf, Dpotrf, Spotrf);
-#endif
 
         A.resize(n*n, false);   // allocate memory if necessary
         if (A0 && A0 != A.data())  myCopy_n(A0, n*n, A.data());
@@ -515,11 +468,6 @@ struct cuCholSolverDn
 
         potrf(handle, uplo, n, A.data(), n, buffer.data(), bufferSize, info.data());
         CUDA_CHECK_ERROR;
-
-        //if (thrust::host_vector<int>(info)[0] != 0) {
-        //    std::cerr << "Error: Cholesky factorization failed\n";
-        //    return -1;
-        //}
 
         return 0;
     }
